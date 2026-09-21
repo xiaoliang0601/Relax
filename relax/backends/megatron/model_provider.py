@@ -29,6 +29,7 @@ from relax.utils.megatron_peft_utils import build_lora_peft, count_adapter_param
 from relax.utils.misc import load_function
 from relax.utils.training.ppo_utils import install_critic_value_head_in_provider
 
+from .arguments import _validate_linear_cp_mode
 from .conditional_branch_sync import install_conditional_branch_sync
 
 
@@ -195,6 +196,9 @@ def get_model_provider_func(
                 model = custom_model_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
             else:
                 model = custom_model_provider(pre_process=pre_process, post_process=post_process)
+            for module in model.modules():
+                if getattr(module, "config", None) is not None:
+                    _validate_linear_cp_mode(args, module.config)
             # Apply critic output layer if needed
             install_critic_value_head_in_provider(model, role, post_process)
             _maybe_mark_unsplit_forward(args, model)
@@ -315,6 +319,7 @@ def get_model_provider_func(
             provider.bf16 = True
             provider.params_dtype = torch.bfloat16
 
+        _validate_linear_cp_mode(args, provider)
         provider.finalize()
 
         # Pickle provider for offline inspection / reproducibility (only on rank 0)
@@ -355,6 +360,7 @@ def get_model_provider_func(
 
         # Experimental loading arguments from yaml
         config: TransformerConfig = core_transformer_config_from_args(args)
+        _validate_linear_cp_mode(args, config)
 
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)

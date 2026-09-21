@@ -256,3 +256,125 @@ def test_prebuild_is_a_noop_without_context_parallelism():
     non_thd = PackedSeqParams(qkv_format="sbhd")
     cpl.prebuild_thd_cp_partition_routes(non_thd)
     assert getattr(non_thd, "cp_partition_route_zigzag_to_contiguous", None) is None
+
+
+def test_route_does_not_cache_unversioned_inference_boundaries():
+    with torch.inference_mode():
+        cu = _cu([3, 1], unit=8)
+        psp = _packed_seq_params(cu)
+        first = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
+        cu.copy_(_cu([2, 2], unit=8))
+        second = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
+        assert second is not first
+        expected = cpl.build_thd_cp_partition_route(cu, 4, 1, "zigzag", "contiguous")
+        assert second.input_split_sizes == expected.input_split_sizes
+
+
+def _boundary_resolver():
+    from types import SimpleNamespace
+
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+
+    calls = []
+    module = SimpleNamespace(cp_size=8)
+
+    def resolve(*args, **kwargs):
+        calls.append(kwargs["cp_size"])
+        return GatedDeltaNet._resolve_cu_seqlens(module, *args, **kwargs)
+
+    module._resolve_cu_seqlens = resolve
+    return module, calls, GatedDeltaNet._resolve_thd_cu_seqlens
+
+
+def test_boundary_validation_is_shared_across_layers_and_recompute():
+    module, calls, resolve = _boundary_resolver()
+    # Static max CP=8 would reject a length of 12; runtime CP=2 is legal.
+    cu = _cu([3, 1], unit=4)
+    psp = _packed_seq_params(cu)
+    first = resolve(module, psp, 16, 2)
+    assert calls == [2, 2]
+    assert resolve(module, psp, 16, 2) is first
+    assert calls == [2, 2]
+
+    other_module, other_calls, _ = _boundary_resolver()
+    assert resolve(other_module, psp, 16, 2) is first
+    assert other_calls == []
+
+
+@pytest.mark.parametrize("change", ["replace", "inplace", "view", "new_pack", "runtime_cp", "global_length", "padded"])
+def test_boundary_cache_is_invalidated_when_inputs_change(change):
+    module, calls, resolve = _boundary_resolver()
+    cu = _cu([3, 1], unit=8)
+    psp = _packed_seq_params(cu)
+    resolve(module, psp, 32, 2)
+    cp_size, total = 2, 32
+    if change == "replace":
+        psp.cu_seqlens_q = cu.clone()
+        psp.cu_seqlens_kv = psp.cu_seqlens_q
+    elif change == "inplace":
+        cu.copy_(_cu([2, 2], unit=8))
+    elif change == "view":
+        cu[1:2].fill_(16)
+    elif change == "new_pack":
+        psp = _packed_seq_params(cu)
+    elif change == "runtime_cp":
+        cp_size = 4
+    elif change == "global_length":
+        total = 64
+    elif change == "padded":
+        psp.cu_seqlens_q_padded = _cu([2, 2], unit=8)
+        psp.cu_seqlens_kv_padded = psp.cu_seqlens_q_padded
+    if change == "global_length":
+        with pytest.raises(ValueError, match="total_sequence_length"):
+            resolve(module, psp, total, cp_size)
+        assert len(calls) == 3
+    else:
+        resolve(module, psp, total, cp_size)
+        assert len(calls) == 4
+
+
+def test_boundary_validation_rechecks_inference_tensors():
+    module, calls, resolve = _boundary_resolver()
+    with torch.inference_mode():
+        cu = _cu([3, 1], unit=8)
+        psp = _packed_seq_params(cu)
+        resolve(module, psp, 32, 2)
+        cu[1] = 16
+        resolve(module, psp, 32, 2)
+        assert len(calls) == 4
+
+
+def test_boundary_cache_does_not_hide_q_kv_mismatch():
+    module, calls, resolve = _boundary_resolver()
+    cu = _cu([3, 1], unit=8)
+    psp = _packed_seq_params(cu)
+    resolve(module, psp, 32, 2)
+    psp.cu_seqlens_kv = _cu([2, 2], unit=8)
+    with pytest.raises(AssertionError, match="cu_seqlens_q equals"):
+        resolve(module, psp, 32, 2)
+
+
+def test_sbhd_context_cache_is_scoped_to_the_process_group(monkeypatch):
+    from types import SimpleNamespace
+
+    from megatron.core.ssm import gated_delta_net as gdn
+
+    contexts = []
+
+    def build_context(**kwargs):
+        context = SimpleNamespace(group=kwargs["group"])
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(gdn, "build_cp_context", build_context)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    module = SimpleNamespace(conv_kernel_dim=4, _chunkwise_cp_context_cache={})
+    first_group, second_group = object(), object()
+    build = gdn.GatedDeltaNet._build_chunkwise_cp_context
+    first = build(module, first_group, 2, None, 32, 1)
+    assert build(module, first_group, 2, None, 32, 1) is first
+    second = build(module, second_group, 2, None, 32, 1)
+    assert second is not first
+    assert first[1].group is first_group
+    assert second[1].group is second_group
+    assert len(contexts) == 2

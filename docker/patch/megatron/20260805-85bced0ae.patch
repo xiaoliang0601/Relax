@@ -651,7 +651,7 @@ index 0000000..c287ffb
 +    input_split_sizes: List[int]
 +    output_split_sizes: List[int]
 +    cu_seqlens: torch.Tensor
-+    cu_seqlens_version: int
++    cu_seqlens_version: Optional[int]
 +    cp_size: int
 +    cp_rank: int
 +    source_layout: str
@@ -888,7 +888,7 @@ index 0000000..c287ffb
 +            input_split_sizes=input_split_sizes,
 +            output_split_sizes=output_split_sizes,
 +            cu_seqlens=cu_seqlens,
-+            cu_seqlens_version=cu_seqlens._version,
++            cu_seqlens_version=None if cu_seqlens.is_inference() else cu_seqlens._version,
 +            cp_size=cp_size,
 +            cp_rank=cp_rank,
 +            source_layout=source_layout,
@@ -920,7 +920,7 @@ index 0000000..c287ffb
 +        return False
 +    if route.cu_seqlens is not cu_seqlens:
 +        return False
-+    if route.cu_seqlens_version != cu_seqlens._version:
++    if cu_seqlens.is_inference() or route.cu_seqlens_version != cu_seqlens._version:
 +        return False
 +    if route.cp_size != cp_size or route.cp_rank != cp_rank:
 +        return False
@@ -2237,7 +2237,7 @@ index 8df4df1..e41d55f 100644
 +        # Non-packed (SBHD) input: cu_seqlens is fully determined by the static global
 +        # sequence length and batch size, so cache both the generated boundaries and
 +        # context. Rebuilding either every forward breaks CUDA graph replay.
-+        cache_key = (seq_len_global, batch)
++        cache_key = (seq_len_global, batch, cp_group_chunkwise)
 +        cached = self._chunkwise_cp_context_cache.get(cache_key)
 +        if cached is None:
 +            cached_cu_seqlens = (
@@ -2293,7 +2293,7 @@ index 8df4df1..e41d55f 100644
          query, key = torch.split(query_key, [split_size, split_size], dim=2)
  
          # Expand query and key if needed (grouped query attention)
-@@ -567,7 +752,67 @@ class GatedDeltaNet(MegatronModule):
+@@ -567,7 +752,68 @@ class GatedDeltaNet(MegatronModule):
          beta = beta.sigmoid()
          return g, beta
  
@@ -2320,9 +2320,10 @@ index 8df4df1..e41d55f 100644
 +            packed_seq_params.cu_seqlens_kv_padded,
 +            packed_seq_params.cu_seqlens_kv,
 +        )
-+        versions = tuple(None if t is None else t._version for t in sources)
++        cacheable = all(t is None or not t.is_inference() for t in sources)
++        versions = tuple(None if t is None or t.is_inference() else t._version for t in sources)
 +        cached = getattr(packed_seq_params, "_gdn_resolved_cu_seqlens", None)
-+        if cached is not None:
++        if cacheable and cached is not None:
 +            cached_meta, cached_sources, cached_versions, cached_value = cached
 +            if (
 +                cached_meta == (seq_len_global, cp_size)
@@ -2362,7 +2363,7 @@ index 8df4df1..e41d55f 100644
          """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
          if cu_seqlens_padded is not None:
              cu_seqlens = cu_seqlens_padded
-@@ -582,6 +827,13 @@ class GatedDeltaNet(MegatronModule):
+@@ -582,6 +828,13 @@ class GatedDeltaNet(MegatronModule):
                  f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
              )
  
@@ -2376,7 +2377,7 @@ index 8df4df1..e41d55f 100644
          return cu_seqlens
  
      def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
-@@ -780,8 +1032,10 @@ def get_parameter_local_cp(
+@@ -780,8 +1033,10 @@ def get_parameter_local_cp(
          torch.Tensor: The local parameter for the current context parallel rank.
      """
  
@@ -2389,7 +2390,7 @@ index 8df4df1..e41d55f 100644
  
      # No need to split if CP size is 1.
      if cp_size == 1:
-@@ -800,7 +1054,7 @@ def get_parameter_local_cp(
+@@ -800,7 +1055,7 @@ def get_parameter_local_cp(
      slices = [slice(None)] * param.dim()
      dim_size = param.size(dim=dim)
      slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
@@ -2398,7 +2399,7 @@ index 8df4df1..e41d55f 100644
      return param
  
  
-@@ -945,6 +1199,7 @@ def torch_chunk_gated_delta_rule(
+@@ -945,6 +1200,7 @@ def torch_chunk_gated_delta_rule(
      output_final_state=False,
      use_qk_l2norm_in_kernel=False,
      cu_seqlens=None,
@@ -2406,7 +2407,7 @@ index 8df4df1..e41d55f 100644
  ):
      # pylint: disable=line-too-long
      '''
-@@ -957,6 +1212,9 @@ def torch_chunk_gated_delta_rule(
+@@ -957,6 +1213,9 @@ def torch_chunk_gated_delta_rule(
      assert (
          cu_seqlens is None
      ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."

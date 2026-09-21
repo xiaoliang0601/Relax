@@ -361,6 +361,12 @@ def get_batch(
             max_seqlen_padded = int(seqlens_padded.max().item())
 
             unsplit_tokens = pad_sequence(tokens, batch_first=True, padding_value=pad_token_id)
+            if unsplit_tokens.size(1) < max_seqlen_padded:
+                unsplit_tokens = F.pad(
+                    unsplit_tokens,
+                    (0, max_seqlen_padded - unsplit_tokens.size(1)),
+                    value=pad_token_id,
+                )
             unsplit_attention_mask = torch.zeros_like(unsplit_tokens, dtype=torch.bool)
             for i, s in enumerate(seqlens.tolist()):
                 unsplit_attention_mask[i, :s] = True

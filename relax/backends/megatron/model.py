@@ -356,19 +356,24 @@ def setup_model_and_optimizer(
     return model, optimizer, opt_param_scheduler
 
 
-def _resolve_gdn_cp(self, packed_seq_params):
+def _resolve_gdn_cp(self, packed_seq_params, pg_collection=None):
     """Resolve (cp_size, cp_group, cp_rank) for a GDN forward.
 
     Prefers the per-micro-batch dynamic CP group carried on
     ``packed_seq_params`` (set in ``data.py``); falls back to the module's
     static CP group.
     """
-    if packed_seq_params is not None and getattr(packed_seq_params, "local_cp_size", None) is not None:
-        cp_group = packed_seq_params.cp_group
-        cp_size = packed_seq_params.local_cp_size
-    else:
-        cp_group = self.pg_collection.cp
-        cp_size = cp_group.size()
+    cp_group = pg_collection.cp if pg_collection is not None else self.pg_collection.cp
+    if packed_seq_params is not None:
+        dynamic_group = getattr(packed_seq_params, "cp_group", None)
+        local_cp_size = getattr(packed_seq_params, "local_cp_size", None)
+        if (dynamic_group is None) != (local_cp_size is None):
+            raise ValueError("PackedSeqParams.cp_group and local_cp_size must both be set or both be None.")
+        if dynamic_group is not None:
+            if local_cp_size != dynamic_group.size():
+                raise ValueError("PackedSeqParams.local_cp_size does not match cp_group.size().")
+            cp_group = dynamic_group
+    cp_size = cp_group.size() if cp_group is not None else 1
     cp_rank = cp_group.rank() if cp_size > 1 else 0
     return cp_size, cp_group, cp_rank
 
@@ -437,7 +442,7 @@ def _patch_gdn_for_dynamic_cp() -> None:
 
         from .cp_utils import gdn_cp_slice
 
-        cp_size, cp_group, cp_rank = _resolve_gdn_cp(self, packed_seq_params)
+        cp_size, cp_group, cp_rank = _resolve_gdn_cp(self, packed_seq_params, kwargs.get("pg_collection"))
         if cp_size == 1 or self.config.linear_cp_mode != "all_gather":
             return _orig_forward(
                 self, hidden_states, attention_mask, inference_context, packed_seq_params, *args, **kwargs
@@ -460,14 +465,19 @@ def _patch_gdn_for_dynamic_cp() -> None:
         )
         _assert_gdn_full_recompute()
 
-        cu_seqlens = packed_seq_params.cu_seqlens_q
+        cu_seqlens, _ = self._resolve_thd_cu_seqlens(
+            packed_seq_params, hidden_states.shape[0] * self.sp_size * cp_size, cp_size
+        )
         # Precompute the host-side boundary list once per micro-batch (cached on the
         # shared packed_seq_params object) so the gather/slice below don't force a
         # per-GDN-layer .tolist() device sync — repeated under full recompute.
-        cu_seqlens_cpu = getattr(packed_seq_params, "_gdn_cu_seqlens_cpu", None)
-        if cu_seqlens_cpu is None:
+        cached = getattr(packed_seq_params, "_gdn_cu_seqlens_cpu", None)
+        version = None if cu_seqlens.is_inference() else cu_seqlens._version
+        if cached is not None and version is not None and cached[0] is cu_seqlens and cached[1] == version:
+            cu_seqlens_cpu = cached[2]
+        else:
             cu_seqlens_cpu = cu_seqlens.tolist()
-            packed_seq_params._gdn_cu_seqlens_cpu = cu_seqlens_cpu
+            packed_seq_params._gdn_cu_seqlens_cpu = (cu_seqlens, version, cu_seqlens_cpu)
         _, batch, _ = hidden_states.shape
 
         # Input projection on the CP-sharded (and SP-sharded) sequence.
