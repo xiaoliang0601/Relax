@@ -1,0 +1,9 @@
+diff --git a/sglang/srt/configs/qwen3_asr.py b/sglang/srt/configs/qwen3_asr.py
+index cb3252b3d47cc35ed51fda77803d31ec604c8d6c..bf2ce3a0742514e4fd8028a1750af22ac279af67 100644
+--- a/sglang/srt/configs/qwen3_asr.py
++++ b/sglang/srt/configs/qwen3_asr.py
+@@ -167,2 +167,2 @@ class Qwen3ASRConfig(PretrainedConfig):
+-AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
+-AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
++AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)
++AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig, exist_ok=True)

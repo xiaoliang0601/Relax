@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import os
 import time
 from contextlib import contextmanager
@@ -268,6 +270,14 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     def _allgather_base(self, *a, **kw):
         return self._fwd("_allgather_base", *a, **kw)
 
+    # PyTorch 2.13 dispatches the tensor collectives through these names,
+    # including callers that cached the public functions before our patch.
+    def all_gather_single(self, *a, **kw):
+        return self._fwd("all_gather_single", *a, **kw)
+
+    def all_gather_single_coalesced(self, *a, **kw):
+        return self._fwd("all_gather_single_coalesced", *a, **kw)
+
     def allgather_coalesced(self, *a, **kw):
         return self._fwd("allgather_coalesced", *a, **kw)
 
@@ -285,6 +295,12 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
 
     def _reduce_scatter_base(self, *a, **kw):
         return self._fwd("_reduce_scatter_base", *a, **kw)
+
+    def reduce_scatter_single(self, *a, **kw):
+        return self._fwd("reduce_scatter_single", *a, **kw)
+
+    def reduce_scatter_single_coalesced(self, *a, **kw):
+        return self._fwd("reduce_scatter_single_coalesced", *a, **kw)
 
     def reduce_scatter_tensor_coalesced(self, *a, **kw):
         return self._fwd("reduce_scatter_tensor_coalesced", *a, **kw)

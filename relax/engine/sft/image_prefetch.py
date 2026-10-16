@@ -3,6 +3,7 @@
 """CPU image reconstruction and bounded cache for SFT prefetch."""
 
 from argparse import Namespace
+from threading import Event
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
@@ -107,6 +108,8 @@ class SFTImagePrefetch:
         partition_id: str,
         task_name: str,
         sampling_config: dict,
+        stop_event: Event | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[list, float]:
         """Background SFT prefetch with the rank-side pixel rebuild.
 
@@ -117,6 +120,11 @@ class SFTImagePrefetch:
         worker process. No collectives and no GPU work happen here; the main
         thread re-attaches the finished tensors in ``resolve``.
         """
+        fetch_options = {}
+        if stop_event is not None:
+            fetch_options["stop_event"] = stop_event
+        if timeout_s is not None:
+            fetch_options["timeout_s"] = timeout_s
         prefetched = self.fetch_data(
             data_fields=data_fields,
             batch_size=batch_size,
@@ -124,6 +132,7 @@ class SFTImagePrefetch:
             task_name=task_name,
             sampling_config=sampling_config,
             batch_index=0,
+            **fetch_options,
         )
         raw_batch = prefetched[0][0]
         if raw_batch is None or not self.owns_vision(model):

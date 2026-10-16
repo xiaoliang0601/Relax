@@ -1,0 +1,58 @@
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -227,7 +227,8 @@
+ try:
+     from torch_memory_saver import torch_memory_saver
+ 
+-    torch_memory_saver.hook_mode = "torch"
++    # Relax uses LD_PRELOAD; keep the same TMS hook for disable() and CUDA IPC.
++    # Forcing torch mode leaves the preload allocator active during weight sync.
+     HAVE_TORCH_MEMORY_SAVER = True
+ except ImportError:
+     HAVE_TORCH_MEMORY_SAVER = False
+--- a/megatron/core/inference/contexts/dynamic_context.py
++++ b/megatron/core/inference/contexts/dynamic_context.py
+@@ -81,7 +81,8 @@
+ try:
+     from torch_memory_saver import torch_memory_saver
+ 
+-    torch_memory_saver.hook_mode = "torch"
++    # Relax uses LD_PRELOAD; keep the same TMS hook for disable() and CUDA IPC.
++    # Forcing torch mode leaves the preload allocator active during weight sync.
+     HAVE_TORCH_MEMORY_SAVER = True
+ except ImportError:
+     HAVE_TORCH_MEMORY_SAVER = False
+diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/transformer/hyper_connection.py
+index 4e4d29d71..f5694cb15 100644
+--- a/megatron/core/transformer/hyper_connection.py
++++ b/megatron/core/transformer/hyper_connection.py
+@@ -883,7 +883,7 @@ def gated_residual_group_rmsnorm(x: Tensor, weight: Tensor, n: int, eps: float)
+
+
+ class GatedResidualMTPHiddenNorm(MegatronModule):
+-    """Normalize MTP's n-stream hidden state with a separate gain for every stream."""
++    """Normalize MTP's flattened n-stream hidden state, matching the draft model."""
+
+     def __init__(self, config: TransformerConfig, hidden_size: int, eps: float):
+         super().__init__(config)
+@@ -900,13 +900,13 @@ class GatedResidualMTPHiddenNorm(MegatronModule):
+     def forward(self, hidden_states: Tensor) -> Tensor:
+         shape = hidden_states.shape
+         assert shape[-2:] == (self.num_streams, self.hidden_size)
+-        result = gated_residual_group_rmsnorm(
+-            hidden_states.reshape(*shape[:-2], self.num_streams * self.hidden_size),
+-            self.weight,
+-            self.num_streams,
+-            self.eps,
+-        )
+-        return result.reshape(shape)
++        # MTP's pre_fc_norm_hidden normalizes over n*H, unlike the backbone's
++        # per-stream HC norm. Keep the common variance before the shared h_proj.
++        flattened = hidden_states.flatten(-2).float()
++        variance = flattened.pow(2).mean(dim=-1, keepdim=True)
++        result = flattened * torch.rsqrt(variance + self.eps)
++        result = result * (1.0 + self.weight.float())
++        return result.to(hidden_states.dtype).reshape(shape)
+
+
+ class GatedResidualHyperConnection(MegatronModule):

@@ -8,6 +8,7 @@ import time
 from argparse import Namespace
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
+from threading import Event
 from typing import Any, List
 
 import ray
@@ -39,6 +40,7 @@ from relax.engine.sft.runtime import (
     is_offline_mode,
     is_preference_mode,
     is_sft_mode,
+    resident_sft_param_overlap_enabled,
     sft_partition_id,
     sft_partition_ids,
     sft_task_name,
@@ -133,7 +135,7 @@ from .data import (
 )
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
-from .model import forward_only, initialize_model_and_optimizer, save, train
+from .model import flush_resident_sft_param_sync, forward_only, initialize_model_and_optimizer, save, train
 from .reference_integrity import (
     DPOReferenceIdentity,
     canonical_tensor_sha256,
@@ -141,6 +143,7 @@ from .reference_integrity import (
     reference_identity_path,
     write_reference_identity,
 )
+from .resident_shared_expert import verify_resident_shared_readiness
 from .weight_update.common import named_params_and_buffers
 from .weight_update.train_offload import MegatronTrainStateOffloader
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
@@ -296,6 +299,42 @@ def _agree_sft_train_prefetch_result(
     return prefetched_fetch
 
 
+def _fetch_sft_train_payload_until_ready(
+    *,
+    stop_event: Event,
+    timeout_s: float,
+    tq_client: Any,
+    data_fields: list[str],
+    batch_size: int,
+    partition_id: str,
+    task_name: str,
+    sampling_config: dict[str, Any],
+    batch_index: int,
+) -> tuple[list, float]:
+    """Poll one SFT partition on CPU; timeout bounds empty-result waits, not
+    RPC calls."""
+    started = time.monotonic()
+    deadline = started + timeout_s
+    while True:
+        if stop_event.is_set():
+            raise RuntimeError(f"SFT train-data prefetch cancelled for {partition_id}.")
+        payload, _ = fetch_data_from_transfer_queue(
+            tq_client=tq_client,
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            task_name=task_name,
+            sampling_config=sampling_config,
+            batch_index=batch_index,
+        )
+        if payload[0] is not None and payload[1].size > 0:
+            return payload, time.monotonic() - started
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"SFT train-data prefetch timed out waiting for {partition_id}.")
+        stop_event.wait(min(0.5, remaining))
+
+
 class _SFTPrepackedDeviceIterator:
     """Two-slot H2D pipeline over fully packed pinned-CPU micro-batches.
 
@@ -404,6 +443,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self._sft_train_prefetch_executor: ThreadPoolExecutor | None = None
         self._sft_train_prefetch: Future[tuple[list, float]] | None = None
         self._sft_train_prefetch_rollout_id: int | None = None
+        self._sft_train_prefetch_stop: Event | None = None
         if is_offline_mode(self.args) and getattr(self.args, "sft_train_data_prefetch", False):
             self._sft_train_prefetch_executor = ThreadPoolExecutor(
                 max_workers=1,
@@ -416,7 +456,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args, "sft_image_preprocess_on_rank", False
         )
         self._sft_image_prefetch = SFTImagePrefetch(
-            self.args, partial(fetch_data_from_transfer_queue, tq_client=self.data_system_client)
+            self.args, partial(_fetch_sft_train_payload_until_ready, tq_client=self.data_system_client)
         )
         if is_megatron_main_rank():
             init_tracking(args, primary=False)
@@ -455,12 +495,48 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.lr = self.args.critic_lr
             self.args.lr_warmup_iters = self.args.critic_lr_warmup_iters
 
+        if getattr(args, "moe_flex_dispatcher_backend", None) == "hybridep" and Envs.QWEN38_HYBRID_EP_ROOT:
+            from .hybridep_preflight import validate_hybridep_worker_group
+
+            validate_hybridep_worker_group()
+
+        if role == "actor":
+            from relax.utils.autotune_logging import install_autotune_logging
+
+            install_autotune_logging(get_gloo_group())
         resumed_from_megatron = not args.finetune and args.load is not None and is_megatron_checkpoint(args.load)
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
         self._dpo_reference_identity: DPOReferenceIdentity | None = None
         self._expected_dpo_reference_identity: DPOReferenceIdentity | None = None
+        if role == "actor":
+            from relax.utils.record_function_tags import install_record_function_tags
+
+            install_record_function_tags(args, self.model)
+            if Envs.RELAX_QWEN38_RETAIN_QSA_ATTENTION:
+                from .megatron_patch.qsa_attention_recompute_patch import install as install_qsa_attention_retention
+
+                install_qsa_attention_retention(args, self.model)
+            if Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION in ("triton_v2", "triton_v3"):
+                if Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION == "triton_v3":
+                    from .megatron_patch.qsa_triton_v3 import _select_config
+                else:
+                    from .megatron_patch.qsa_triton_v2 import _select_config
+
+                device = torch.cuda.current_device()
+                capability = torch.cuda.get_device_capability(device)
+                config = _select_config(args.kv_channels, capability, args.params_dtype)
+                logger.info(
+                    "QSA backend=%s, SM%s%s, dtype=%s, head_dim=%s, "
+                    "dQ tile=%sx%s, warps=%s, stages=%s (device-selected config)",
+                    Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION,
+                    *capability,
+                    args.params_dtype,
+                    args.kv_channels,
+                    *config.dq,
+                )
+            verify_resident_shared_readiness(args, self.model)
 
         if is_lora_enabled(args) and dist.get_rank() == 0:
             self._log_lora_checkpoint_state()
@@ -732,9 +808,33 @@ class MegatronTrainRayActor(TrainRayActor):
                 f"unsupported: {', '.join(unsupported)}."
             )
 
+    def _flush_resident_sft_parameters(self) -> None:
+        if not getattr(self, "_resident_sft_params_pending", False):
+            return
+        flush_resident_sft_param_sync(self.model)
+        if hasattr(self, "weights_backuper"):
+            self.weights_backuper.backup("actor")
+        self._resident_sft_params_pending = False
+
+    def _resident_sft_overlap_enabled(self) -> bool:
+        if not resident_sft_param_overlap_enabled(self.args):
+            return False
+        tags = set(self.weights_backuper.backup_tags) if hasattr(self, "weights_backuper") else set()
+        if (
+            self.role != "actor"
+            or self._per_step_rollout
+            or getattr(self, "rollout_manager", None) is not None
+            or getattr(self, "_active_model_tag", None) != "actor"
+            or tags != {"actor"}
+        ):
+            raise RuntimeError("Resident SFT overlap cannot coexist with rollout, reference/teacher or model swapping")
+        self.args._relax_resident_sft_actor_verified = True
+        return True
+
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
+        self._flush_resident_sft_parameters()
 
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
@@ -791,6 +891,7 @@ class MegatronTrainRayActor(TrainRayActor):
         print_memory("after wake_up model")
 
     def _switch_model(self, target_tag: str) -> None:
+        self._flush_resident_sft_parameters()
         # Backend-specific bookkeeping is handled in device utils so this
         # framework path stays hardware-agnostic.
         device_utils.maybe_backend_process_on_model_switch()
@@ -1231,6 +1332,8 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_offline:
             should_run_eval = should_run_sft_eval(self.args, rollout_id)
             should_run_predict = has_rollout and should_run_sft_predict(self.args, rollout_id)
+            if should_run_eval or should_run_predict:
+                self._flush_resident_sft_parameters()
             try:
                 if should_run_eval:
                     if rollout_id > 0 and dist.get_rank() == 0:
@@ -1920,6 +2023,39 @@ class MegatronTrainRayActor(TrainRayActor):
         if self._per_step_rollout and self.args.offload_train:
             self.sleep()
 
+    @timer("actor_weight_backup")
+    def _backup_actor_weights_after_train(self) -> None:
+        if not hasattr(self, "weights_backuper") or self._resident_sft_params_pending:
+            return
+        # Resident SFT eval/checkpoint readers use self.model directly. Keep
+        # initialization and explicit reader flushes intact, but avoid copying
+        # every (including frozen/CPU-offloaded) parameter after each step when
+        # no model swap or rollout consumer can read the snapshot.
+        if (
+            is_sft_mode(self.args)
+            and self.role == "actor"
+            and not self._per_step_rollout
+            and getattr(self, "rollout_manager", None) is None
+            and getattr(self, "_active_model_tag", None) == "actor"
+            and set(self.weights_backuper.backup_tags) == {"actor"}
+            and getattr(self.args, "sft_predict_interval", None) is None
+            and not any(
+                getattr(self.args, flag, False)
+                for flag in (
+                    "offload_train",
+                    "fully_async",
+                    "hybrid",
+                    "keep_old_actor",
+                    "use_critic",
+                    "compute_advantages_and_returns",
+                    "custom_megatron_before_train_step_hook_path",
+                    "rollout_data_postprocess_path",
+                )
+            )
+        ):
+            return
+        self.weights_backuper.backup("actor")
+
     def train_actor(
         self,
         rollout_id: int,
@@ -1930,6 +2066,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_preference_mode(self.args):
             rollout_data = expand_preference_rollout_data(rollout_data)
 
+        resident_overlap = self._resident_sft_overlap_enabled()
         use_indexer_replay = getattr(self.args, "use_rollout_indexer_replay", False)
         if use_indexer_replay:
             from relax.utils.training.indexer_replay import IndexerReplay
@@ -1951,7 +2088,8 @@ class MegatronTrainRayActor(TrainRayActor):
         # Create data iterator for actor forward + routing replay + train.
         uses_prepared_sft_window = prepared_data_iterator is not None and prepared_num_microbatches is not None
         if not uses_prepared_sft_window:
-            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            with timer("train_data_iterator"):
+                data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         else:
             data_iterator, num_microbatches = prepared_data_iterator, prepared_num_microbatches
         # Create a separate iterator with a larger token budget for ref/teacher log-probs
@@ -2077,6 +2215,9 @@ class MegatronTrainRayActor(TrainRayActor):
                         data_iterator,
                         num_microbatches,
                     )
+                    # Record pending gathers before iterator/profiler cleanup:
+                    # explicit readers must still synchronize if cleanup fails.
+                    self._resident_sft_params_pending = resident_overlap and rollout_id + 1 < self.args.num_rollout
                 finally:
                     for iterator in data_iterator:
                         close = getattr(iterator, "close", None)
@@ -2094,9 +2235,9 @@ class MegatronTrainRayActor(TrainRayActor):
         if use_indexer_replay:
             IndexerReplay.finish_step(expect_backward=self.args.recompute_granularity == "full")
 
-        # update the cpu actor weight to the latest model
-        if hasattr(self, "weights_backuper"):
-            self.weights_backuper.backup("actor")
+        # Backup/statistics are reported now, but contribute to the NEXT
+        # step's train_wait (which closes at the next train context entry).
+        self._backup_actor_weights_after_train()
 
         # Update ref model if needed
         if (
@@ -2110,45 +2251,46 @@ class MegatronTrainRayActor(TrainRayActor):
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")
                 self.weights_backuper.backup("ref")
 
-        total_lengths = rollout_data["total_lengths"]
-        all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
-        dist.all_gather_object(
-            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
-        )
-        all_total_lengths = sum(all_total_lengths, [])  # flatten
-        Timer().seq_lens = all_total_lengths
-        # Count supervised tokens (loss_mask==1) per sample. For SFT this is the
-        # assistant-only tokens; for RL it's the response-only mask sum. Avoids
-        # the SFT `response_length == total_length` convention (see data.py:296).
-        response_token_counts = [
-            int(m.sum().item()) if isinstance(m, torch.Tensor) else int(sum(m)) for m in rollout_data["loss_masks"]
-        ]
-        all_response_token_counts = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
-        dist.all_gather_object(
-            all_response_token_counts,
-            response_token_counts,
-            group=mpu.get_data_parallel_group(with_context_parallel=False),
-        )
-        all_response_token_counts = sum(all_response_token_counts, [])  # flatten
-        Timer().response_lens = all_response_token_counts
-        Timer().images_seqlens = []
-        Timer().image_grid_thw = []
-        Timer().audio_seqlens = []
-        mm_inputs = rollout_data.get("multimodal_train_inputs")
-        if mm_inputs is not None:
-            image_grids = _extract_image_grids(mm_inputs)
-            all_image_grids = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+        with timer("train_postprocess"):
+            total_lengths = rollout_data["total_lengths"]
+            all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
-                all_image_grids, image_grids, group=mpu.get_data_parallel_group(with_context_parallel=False)
+                all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
-            Timer().image_grid_thw = sum(all_image_grids, [])
-            Timer().images_seqlens = [h * w for t, h, w in Timer().image_grid_thw for _ in range(t)]
-            audio_seqlens = _extract_audio_seqlens(mm_inputs)
-            all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            all_total_lengths = sum(all_total_lengths, [])  # flatten
+            Timer().seq_lens = all_total_lengths
+            # Count supervised tokens (loss_mask==1) per sample. For SFT this is the
+            # assistant-only tokens; for RL it's the response-only mask sum. Avoids
+            # the SFT `response_length == total_length` convention (see data.py:296).
+            response_token_counts = [
+                int(m.sum().item()) if isinstance(m, torch.Tensor) else int(sum(m)) for m in rollout_data["loss_masks"]
+            ]
+            all_response_token_counts = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
-                all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+                all_response_token_counts,
+                response_token_counts,
+                group=mpu.get_data_parallel_group(with_context_parallel=False),
             )
-            Timer().audio_seqlens = sum(all_audio_seqlens, [])
+            all_response_token_counts = sum(all_response_token_counts, [])  # flatten
+            Timer().response_lens = all_response_token_counts
+            Timer().images_seqlens = []
+            Timer().image_grid_thw = []
+            Timer().audio_seqlens = []
+            mm_inputs = rollout_data.get("multimodal_train_inputs")
+            if mm_inputs is not None:
+                image_grids = _extract_image_grids(mm_inputs)
+                all_image_grids = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+                dist.all_gather_object(
+                    all_image_grids, image_grids, group=mpu.get_data_parallel_group(with_context_parallel=False)
+                )
+                Timer().image_grid_thw = sum(all_image_grids, [])
+                Timer().images_seqlens = [h * w for t, h, w in Timer().image_grid_thw for _ in range(t)]
+                audio_seqlens = _extract_audio_seqlens(mm_inputs)
+                all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+                dist.all_gather_object(
+                    all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+                )
+                Timer().audio_seqlens = sum(all_audio_seqlens, [])
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
@@ -2164,10 +2306,14 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.sleep()
             if has_rollout:
                 self.update_weights()
-        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+        # These tail timers, like the tail itself, are reported on the next
+        # step: log_perf_data above resets completed timers, not train_wait.
+        with timer("train_metrics_flush"):
+            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id), wait=is_train_done)
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
         # uses local eval/predict runner below.
-        dist.barrier(group=get_gloo_group())
+        with timer("train_step_barrier"):
+            dist.barrier(group=get_gloo_group())
         self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
 
         # On the final training step the rollout component has already exited
@@ -2793,6 +2939,7 @@ class MegatronTrainRayActor(TrainRayActor):
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         if self.args.debug_rollout_only:
             return
+        self._flush_resident_sft_parameters()
 
         # torch dist may trigger nccl communication during saving; resume the
         # paused model (process groups + tms) so save can issue collectives and
@@ -2848,6 +2995,7 @@ class MegatronTrainRayActor(TrainRayActor):
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
+        self._flush_resident_sft_parameters()
 
         if self.args.offload_train:
             # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
@@ -3428,6 +3576,10 @@ class MegatronTrainRayActor(TrainRayActor):
             "task_name": task_name,
         }
         self._sft_train_prefetch_rollout_id = next_rollout_id
+        self._sft_train_prefetch_stop = Event()
+        tq_timeout_min = float(getattr(self.args, "sft_tq_timeout_minutes", None) or 30)
+        collective_timeout_min = float(getattr(self.args, "distributed_timeout_minutes", None) or 30)
+        timeout_s = min(tq_timeout_min, 0.8 * collective_timeout_min) * 60
         if getattr(self, "_sft_image_preprocess_on_rank", False):
             # The TQ payload carries image references instead of pixels; the
             # same background worker continues with the file read + pixel
@@ -3435,6 +3587,8 @@ class MegatronTrainRayActor(TrainRayActor):
             self._sft_train_prefetch = self._sft_train_prefetch_executor.submit(
                 self._sft_image_prefetch.fetch,
                 next_rollout_id,
+                stop_event=self._sft_train_prefetch_stop,
+                timeout_s=timeout_s,
                 model=self.model,
                 data_fields=data_fields,
                 batch_size=batch_size,
@@ -3444,7 +3598,9 @@ class MegatronTrainRayActor(TrainRayActor):
             )
         else:
             self._sft_train_prefetch = self._sft_train_prefetch_executor.submit(
-                fetch_data_from_transfer_queue,
+                _fetch_sft_train_payload_until_ready,
+                stop_event=self._sft_train_prefetch_stop,
+                timeout_s=timeout_s,
                 tq_client=self.data_system_client,
                 data_fields=data_fields,
                 batch_size=batch_size,
@@ -3463,13 +3619,17 @@ class MegatronTrainRayActor(TrainRayActor):
             return None
         future = self._sft_train_prefetch
         prefetched_rollout_id = self._sft_train_prefetch_rollout_id
+        stop_event = getattr(self, "_sft_train_prefetch_stop", None)
         self._sft_train_prefetch = None
         self._sft_train_prefetch_rollout_id = None
+        self._sft_train_prefetch_stop = None
         prefetched_fetch = None
         local_error: BaseException | None = None
         fatal = False
 
         if future is not None and prefetched_rollout_id != rollout_id:
+            if stop_event is not None:
+                stop_event.set()
             logger.warning(
                 "Discarding stale SFT train-data prefetch: prefetched rollout_id=%s, requested=%s.",
                 prefetched_rollout_id,
@@ -3505,10 +3665,14 @@ class MegatronTrainRayActor(TrainRayActor):
         once."""
         future = self._sft_train_prefetch
         executor = self._sft_train_prefetch_executor
+        stop_event = getattr(self, "_sft_train_prefetch_stop", None)
         image_prefetch = getattr(self, "_sft_image_prefetch", None)
         self._sft_train_prefetch = None
         self._sft_train_prefetch_rollout_id = None
+        self._sft_train_prefetch_stop = None
         self._sft_train_prefetch_executor = None
+        if stop_event is not None:
+            stop_event.set()
         if future is not None:
             future.cancel()
         if executor is not None:

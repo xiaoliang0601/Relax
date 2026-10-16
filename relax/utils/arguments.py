@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import warnings
@@ -79,6 +80,14 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+def _nonnegative_finite_float(value: str) -> float:
+    """argparse type for bounded auxiliary-loss coefficients."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a finite non-negative float, got {value!r}")
     return parsed
 
 
@@ -330,6 +339,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="thd",
                 help="The qkv layout for Megatron backend.",
             )
+            qsa_coeff_option = "--qsa-indexer-loss-coeff"
+            if qsa_coeff_option in parser._option_string_actions:
+                # Megatron registers TransformerConfig fields on newer revisions.
+                qsa_coeff_action = parser._option_string_actions[qsa_coeff_option]
+                qsa_coeff_action.type = _nonnegative_finite_float
+                qsa_coeff_action.default = 0.0
+            else:
+                parser.add_argument(
+                    qsa_coeff_option,
+                    type=_nonnegative_finite_float,
+                    default=0.0,
+                    help="QSA Stage-2 indexer KL coefficient; positive values require the opt-in selected-ID sparse backend.",
+                )
             parser.add_argument(
                 "--true-on-policy-mode",
                 action="store_true",
@@ -1513,6 +1535,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-packing-strategy",
+                type=str,
+                default="balanced",
+                choices=["balanced", "binpack"],
+                help=(
+                    "How --use-dynamic-batch-size assigns samples to micro batches. "
+                    "'balanced' (default) uses Karmarkar-Karp to equalize the token sum of every "
+                    "micro batch, with a capacity-safe first-fit fallback for "
+                    "the --max-tokens-per-gpu cap. "
+                    "'binpack' uses worst-fit-decreasing with capacity "
+                    "max_tokens_per_gpu * cp_size, reproducing ms-swift's packing_strategy='binpack' "
+                    "within each local update; oversized samples remain isolated."
+                ),
+            )
+            parser.add_argument(
                 "--max-tokens-per-gpu",
                 type=int,
                 default=None,
@@ -2397,6 +2434,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Number of rollout steps after which to dump the memory snapshot. "
                 "For example, --memory-snapshot-num-steps 3 dumps after step 2 (0-indexed).",
+            )
+            parser.add_argument(
+                "--profile-output-dir",
+                type=str,
+                default="traces",
+                help="Root directory for profiler outputs. Experiment name and trace type are appended.",
             )
             parser.add_argument(
                 "--profile-target",

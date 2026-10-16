@@ -27,7 +27,11 @@ from relax.engine.sft.dataset.deepseek_chat_template_patch import (
     try_patch_deepseek_chat_template,
 )
 from relax.engine.sft.dataset.gemma4_chat_template_patch import try_patch_gemma4_thinking
-from relax.engine.sft.dataset.qwen_chat_template_patch import try_patch_qwen_chat_template
+from relax.engine.sft.dataset.qwen_chat_template_patch import (
+    is_qwen38_chat_template,
+    split_qwen38_leading_thinking,
+    try_patch_qwen_chat_template,
+)
 from relax.engine.sft.dataset.raw_text import _render_raw_text_concat, raw_text_concat_enabled
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 from relax.utils.data.kimi_k3 import encode_kimi_k3_sft, is_kimi_k3_tokenizer, make_kimi_k3_sft_request
@@ -57,6 +61,7 @@ def _to_chat_messages(
     sample: CanonicalSample,
     *,
     normalize_deepseek_reasoning: bool = False,
+    normalize_qwen38_reasoning: bool = False,
 ) -> list[dict[str, Any]]:
     """Convert CanonicalMessage list to dict format expected by
     apply_chat_template."""
@@ -66,6 +71,24 @@ def _to_chat_messages(
         reasoning_content = m.reasoning_content
         if normalize_deepseek_reasoning and m.role == "assistant" and reasoning_content is None:
             reasoning_content, content = split_embedded_thinking(content)
+        if normalize_qwen38_reasoning and m.role == "assistant":
+            text_item = (
+                content[0]
+                if isinstance(content, list)
+                and len(content) == 1
+                and isinstance(content[0], dict)
+                and content[0].get("type") == "text"
+                and isinstance(content[0].get("text"), str)
+                else None
+            )
+            split = split_qwen38_leading_thinking(
+                content if isinstance(content, str) else text_item["text"] if text_item is not None else ""
+            )
+            if split is not None:
+                if reasoning_content is not None:
+                    raise ValueError("Qwen3.8 assistant has both reasoning_content and a leading <think> block")
+                reasoning_content, answer = split
+                content = answer if text_item is None else [{**text_item, "text": answer}]
         d: dict[str, Any] = {"role": m.role, "content": content}
         if reasoning_content is not None:
             d["reasoning_content"] = reasoning_content
@@ -92,6 +115,7 @@ def _render_with_assistant_mask(
     tokenizer,
     apply_chat_template_kwargs: dict | None = None,
     normalize_deepseek_reasoning: bool = False,
+    normalize_qwen38_reasoning: bool = False,
     last_turn_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Path 1: ask tokenizer for the assistant-only mask directly."""
@@ -104,6 +128,7 @@ def _render_with_assistant_mask(
         apply_chat_template_kwargs,
         last_turn_only=last_turn_only,
         normalize_deepseek_reasoning=normalize_deepseek_reasoning,
+        normalize_qwen38_reasoning=normalize_qwen38_reasoning,
     )
     result = tokenizer.apply_chat_template(
         messages,
@@ -428,6 +453,7 @@ def _prepare_chat_messages(
     *,
     last_turn_only: bool,
     normalize_deepseek_reasoning: bool = False,
+    normalize_qwen38_reasoning: bool = False,
 ) -> tuple[list[dict[str, Any]], dict]:
     """Prepare template input, including the ms-swift non-thinking prefix.
 
@@ -439,8 +465,14 @@ def _prepare_chat_messages(
     """
     template_kwargs = dict(apply_chat_template_kwargs or {})
     add_non_thinking_prefix = bool(template_kwargs.pop("add_non_thinking_prefix", False))
-    messages = _to_chat_messages(sample, normalize_deepseek_reasoning=normalize_deepseek_reasoning)
-    if not add_non_thinking_prefix:
+    messages = _to_chat_messages(
+        sample,
+        normalize_deepseek_reasoning=normalize_deepseek_reasoning,
+        normalize_qwen38_reasoning=normalize_qwen38_reasoning,
+    )
+    if not add_non_thinking_prefix or normalize_qwen38_reasoning:
+        # Qwen3.8's native template renders one think scaffold per assistant
+        # under its preserve gate; inserting another prefix duplicates it.
         return messages, template_kwargs
 
     start_index = (
@@ -519,6 +551,7 @@ def _render_per_message_fallback(
     ``{% generation %}`` markers so Path 1 handles them natively.
     """
     deepseek_dialect = _select_dialect(effective_template)
+    qwen38_template = is_qwen38_chat_template(effective_template)
     msgs, extra_kwargs = _prepare_chat_messages(
         sample,
         apply_chat_template_kwargs,
@@ -527,6 +560,7 @@ def _render_per_message_fallback(
             deepseek_dialect.name == "deepseek_v4"
             and _EMBEDDED_THINK_INDICES_KEY in (apply_chat_template_kwargs or {})
         ),
+        normalize_qwen38_reasoning=qwen38_template,
     )
     rendered_text = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=False, **extra_kwargs)
 
@@ -623,8 +657,10 @@ def _render_per_message_fallback(
                 mask_start = think_end
             elif dialect.think_open is not None and rendered_text.startswith(dialect.think_open, content_start):
                 if dialect.think_close is None:
-                    # ChatML: only the opener is excluded; the reasoning body is learned.
-                    mask_start += len(dialect.think_open)
+                    # ms-swift's Qwen3.8 ignore_empty_think policy learns the
+                    # opener on nonempty thinking; other ChatML skips it.
+                    if not (qwen38_template and ignore_empty_think):
+                        mask_start += len(dialect.think_open)
                 else:
                     # Delimited block (gemma-4): the whole reasoning span stays out of
                     # the loss, so training targets only the visible reply.
@@ -774,6 +810,7 @@ def render_with_loss_mask(
             tokenizer=tokenizer,
             apply_chat_template_kwargs=merged,
             normalize_deepseek_reasoning=_EMBEDDED_THINK_INDICES_KEY in merged,
+            normalize_qwen38_reasoning=is_qwen38_chat_template(effective_template),
             last_turn_only=last_turn_only,
         )
 
@@ -824,6 +861,7 @@ def render_to_text(
         patch_result.kwargs,
         last_turn_only=last_turn_only,
         normalize_deepseek_reasoning=_EMBEDDED_THINK_INDICES_KEY in patch_result.kwargs,
+        normalize_qwen38_reasoning=is_qwen38_chat_template(patch_result.template),
     )
     return tokenizer.apply_chat_template(
         messages,

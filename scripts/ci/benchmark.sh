@@ -11,7 +11,7 @@ EXTRA_ARGS="$*"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="${SCRIPT_DIR}/../.."
 
-curl -fsSL https://image-url-2-feature-1251524319.cos.ap-shanghai.myqcloud.com/wuhuan2/lib/relax/internal_setup.sh | bash
+curl -fsSL "${RELAX_BENCHMARK_SETUP_URL:?Set RELAX_BENCHMARK_SETUP_URL to a trusted setup script URL}" | bash
 
 # ── find training script in categorized subdirectories ──────────────────────
 # CI passes TASK_NAME like "run-qwen3-4B-4xgpu-async" (no .sh suffix).

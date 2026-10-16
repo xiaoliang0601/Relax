@@ -35,7 +35,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
-from relax.engine.sft.runtime import is_rm_mode, should_bypass_main_output_layer
+from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.device import device_module
@@ -63,6 +63,7 @@ from .checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
+from .conditional_branch_sync import disable_frozen_conditional_branch_sync
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
 from .loss import loss_function, normalize_reduced_loss_metrics
 from .model_provider import (
@@ -121,6 +122,7 @@ def _bypass_output_layer(
     *,
     mtp_output_layer_calls: int = 0,
     gather_passthrough: bool = True,
+    recompute_chunks: bool = False,
 ) -> Iterator[Callable | None]:
     """Defer the main output_layer so model() returns hidden_states.
 
@@ -145,6 +147,9 @@ def _bypass_output_layer(
         yield None
         return
 
+    if recompute_chunks and getattr(getattr(output_layer, "config", None), "defer_embedding_wgrad_compute", False):
+        raise ValueError("Chunked SFT recomputation requires deferred embedding wgrad off in the model config")
+
     original_forward = output_layer.forward
     sp_enabled = bool(getattr(output_layer, "sequence_parallel", False))
     tp_group = getattr(output_layer, "tp_group", None) or mpu.get_tensor_model_parallel_group()
@@ -167,6 +172,9 @@ def _bypass_output_layer(
             )
         if main_head_deferred:
             raise RuntimeError("output_layer was called more than once after all MTP head calls")
+        if getattr(output_layer, "_relax_chunked_grad_overlap_safe", False) and weight is not None:
+            if weight is not output_layer.weight:
+                raise ValueError("Chunked gradient overlap does not support an external head weight")
         main_head_deferred = True
         deferred_weight = weight
         if sp_enabled and gather_passthrough:
@@ -178,6 +186,9 @@ def _bypass_output_layer(
         # The VL bridge upcasts hidden_states to fp32 before output_layer; downcast
         # here so matmul stays bf16/bf16. The caller upcasts logits back to fp32.
         call_weight = weight if weight is not None else deferred_weight
+        if getattr(output_layer, "_relax_chunked_grad_overlap_safe", False) and call_weight is not None:
+            if call_weight is not output_layer.weight:
+                raise ValueError("Chunked gradient overlap does not support an external head weight")
         w = call_weight if call_weight is not None else output_layer.weight
         if w is None:
             raise RuntimeError("Unable to resolve lm_head weight for chunked SFT loss")
@@ -190,6 +201,24 @@ def _bypass_output_layer(
         finally:
             output_layer.sequence_parallel = prev_sp
 
+    def _fused_ce(input_: torch.Tensor, labels: torch.Tensor, temperature: float) -> torch.Tensor | None:
+        from .fused_linear_ce import linear_cross_entropy, supported
+
+        weight = deferred_weight if deferred_weight is not None else output_layer.weight
+        if not supported(output_layer, input_, weight):
+            return None
+        loss, _ = linear_cross_entropy(
+            input_,
+            weight,
+            labels,
+            tp_group,
+            temperature=temperature,
+            accumulate=output_layer.gradient_accumulation_fusion,
+        )
+        return loss
+
+    _chunked_call._relax_fused_linear_ce = _fused_ce
+    _chunked_call._relax_chunked_grad_overlap_safe = getattr(output_layer, "_relax_chunked_grad_overlap_safe", False)
     output_layer.forward = _passthrough
     try:
         yield _chunked_call
@@ -326,6 +355,14 @@ def _is_vit_parameter_name(name: str) -> bool:
 def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig) -> dict:
     """Build Megatron optimizer overrides, including the optional MS-Swift-
     style ViT LR group."""
+    if Envs.RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS:
+        if getattr(args, "vit_lr", None) is not None:
+            raise ValueError("RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS is incompatible with --vit-lr")
+        # The standard Megatron groups set wd_mult=0 for biases and 1-D
+        # parameters. The strict AutoModel parity baseline used a single AdamW
+        # group, so every trainable parameter received the configured decay.
+        return {}
+
     config_overrides = get_standard_config_overrides(config)
     vit_lr = getattr(args, "vit_lr", None)
     if vit_lr is None:
@@ -381,6 +418,44 @@ def _validate_vit_lr_trainable_params(args: Namespace, model: list[DDP]) -> None
         raise RuntimeError("--vit-lr did not match any trainable vision-encoder parameters in the distributed model.")
 
 
+def _configure_chunked_head_grad_sync(args: Namespace, model: Sequence[DDP]) -> None:
+    """Install the chunked head's completion policy after DDP builds
+    buckets."""
+    if not (
+        getattr(args, "loss_type", None) == "sft"
+        and getattr(args, "sft_chunked_logits", False)
+        and getattr(args, "recompute_loss_function", False)
+        and getattr(args, "overlap_grad_reduce", False)
+    ):
+        return
+    if (
+        getattr(args, "enable_mtp_training", False)
+        or getattr(args, "mtp_num_layers", 0)
+        or not getattr(args, "untie_embeddings_and_output_weights", False)
+        or getattr(args, "cuda_graph_impl", "none") != "none"
+        or getattr(args, "dynamic_context_parallel", False)
+        or getattr(args, "num_distributed_optimizer_instances", 1) != 1
+    ):
+        raise ValueError("Chunked gradient overlap requires untied head, no MTP/graphs/dynamic CP and one optimizer")
+    from .chunked_grad_sync import defer_head_bucket_grad_sync
+
+    for model_chunk in model:
+        output_layer = _find_lm_output_layer(model_chunk)
+        if output_layer is None:
+            continue
+        if getattr(output_layer, "weight", None) is None:
+            raise ValueError("Chunked gradient overlap requires the head's own weight")
+        head_params = [param for param in output_layer.parameters(recurse=False) if param.requires_grad]
+        mapping = getattr(model_chunk, "param_to_bucket_group", {})
+        if any(param not in mapping for param in head_params):
+            raise RuntimeError("Trainable chunked head parameter has no DDP bucket")
+        groups = {mapping[param] for param in head_params}
+        for group in groups:
+            defer_head_bucket_grad_sync(group)
+        output_layer._relax_chunked_grad_overlap_safe = True
+        logger.info("Deferred chunked head gradient reduction for %s bucket group(s)", len(groups))
+
+
 def setup_model_and_optimizer(
     args: Namespace,
     role: str = "actor",
@@ -411,6 +486,9 @@ def setup_model_and_optimizer(
         wrap_with_ddp=role in ["actor", "critic"],
     )
     validate_mtp_only_trainable_params(args, model)
+    _configure_chunked_head_grad_sync(args, model)
+    for model_chunk in model:
+        disable_frozen_conditional_branch_sync(_unwrap_module(model_chunk))
 
     # Some model providers (e.g., Qwen3VLGPTModel) rebuild the decoder in __init__,
     # which causes duplicate RoutingReplay registrations. Rebuild the list from
@@ -425,6 +503,8 @@ def setup_model_and_optimizer(
                     active_replays.append(module.routing_replay)
         if active_replays:
             RoutingReplay.all_routing_replays = active_replays
+
+    _patch_gdn_cu_seqlens_validation()
 
     if getattr(args, "dynamic_context_parallel", False) or getattr(args, "context_parallel_size", 1) > 1:
         # Global, idempotent GatedDeltaNet patch — apply whenever CP is active
@@ -518,6 +598,64 @@ def _gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group):
     from .cp_utils import gdn_cp_gather_full
 
     return gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group)
+
+
+def _patch_gdn_cu_seqlens_validation() -> None:
+    """Memoize ``GatedDeltaNet._resolve_cu_seqlens`` to drop redundant D2H
+    syncs.
+
+    Upstream re-validates ``cu_seqlens`` inside every GDN layer's forward
+    (``gated_delta_net.py``), and each validation costs two device syncs:
+    ``cu_seqlens[-1].cpu().item()`` and ``(seq_lengths % cp_size != 0).any()``
+    consumed by a Python ``if``. It is called twice per layer (q and kv), so a
+    Qwen3.5-style model with 30 GDN layers pays ~120 syncs per microbatch
+    forward -- doubled again when ``--recompute-modules gdn`` replays the
+    forward during backward.
+
+    The validated invariant is identical across layers and constant for a
+    microbatch, so one check per ``(cu_seqlens tensor, total_seq_len, cp_size)``
+    suffices. Relax builds ``cu_seqlens`` fresh per microbatch and passes the
+    *same* tensor object as both ``cu_seqlens_q`` and ``cu_seqlens_kv``
+    (``data.py``), so a single-entry cache collapses all calls in a microbatch
+    to one real validation and turns over naturally on the next microbatch.
+
+    Correctness rests on the cache holding a strong reference and comparing
+    with ``is`` and checking the tensor version: in-place changes require
+    revalidation. Inference tensors without version counters bypass the cache.
+    Idempotent; monkey-patch only, so
+    it degrades to a no-op on Megatron builds without this helper.
+    """
+    try:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    except ImportError:
+        return
+
+    if getattr(GatedDeltaNet, "_relax_cu_seqlens_memoized", False):
+        return
+
+    _orig_resolve = getattr(GatedDeltaNet, "_resolve_cu_seqlens", None)
+    if _orig_resolve is None:
+        return
+
+    # Single entry: (cu_seqlens tensor, total_seq_len, cp_size) of the last validation.
+    last: dict[str, Any] = {}
+
+    def _memoized_resolve(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1):
+        cu_seqlens = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens_actual
+        try:
+            version = cu_seqlens._version
+        except (AttributeError, RuntimeError):
+            return _orig_resolve(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size=cp_size)
+        prev = last.get("key")
+        if prev is not None and prev[0] is cu_seqlens and prev[1:] == (total_seq_len, cp_size, version):
+            return last["resolved"]
+        resolved = _orig_resolve(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size=cp_size)
+        last["key"] = (cu_seqlens, total_seq_len, cp_size, version)
+        last["resolved"] = resolved
+        return resolved
+
+    GatedDeltaNet._resolve_cu_seqlens = _memoized_resolve
+    GatedDeltaNet._relax_cu_seqlens_memoized = True
 
 
 def _patch_gdn_for_dynamic_cp(linear_cp_mode: str | None = None) -> None:
@@ -729,6 +867,7 @@ def has_conditional_branch_sync(model_chunks: Sequence[DDP]) -> bool:
     adapter."""
     return any(
         getattr(_unwrap_module(model_chunk), "_relax_conditional_branch_sync_installed", False)
+        and getattr(_unwrap_module(model_chunk), "_relax_conditional_branch_sync_active", True)
         for model_chunk in model_chunks
     )
 
@@ -752,6 +891,14 @@ def _restore_micro_batch_output_order(values: list, micro_batch_indices: list[li
     for value, origin_index in zip(values, origin_indices, strict=False):
         origin_values[origin_index] = value
     return origin_values
+
+
+def flush_resident_sft_param_sync(model_chunks: Sequence[DDP]) -> None:
+    """Publish full parameters before a resident SFT weight reader or
+    offload."""
+    disable_forward_pre_hook(model_chunks, param_sync=True)
+    enable_forward_pre_hook(model_chunks)
+    get_model_config(model_chunks[0])._relax_resident_sft_hooks_ready = False
 
 
 @torch.no_grad()
@@ -827,6 +974,7 @@ def forward_only(
                 "max_seq_lens",
                 "classification_labels",
                 "sample_weights",
+                "pre_shifted_labels",
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
@@ -907,6 +1055,8 @@ def forward_only(
             with_entropy=args.use_rollout_entropy,
             max_seq_lens=batch.get("max_seq_lens", None),
             padded_total_lengths=batch.get("padded_total_lengths", None),
+            cp_output_is_zigzag=batch.get("cp_output_is_zigzag", False),
+            pre_shifted_labels=batch.get("unconcat_pre_shifted_labels"),
             loss_masks=batch.get("loss_masks", None),
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
@@ -1055,6 +1205,19 @@ def _is_global_zero_token_step(losses_reduced: list[dict[str, object]]) -> bool:
     return bool(signal.item())
 
 
+def _finalize_model_grads_with_cache_release(*args: Any, **kwargs: Any) -> None:
+    """Release inactive CUDA blocks before Megatron's gradient collectives."""
+    reserved_before = torch.cuda.memory_reserved()
+    torch.cuda.empty_cache()
+    logger.info(
+        "Pre-grad-sync cache release: reserved_before=%s reserved_after=%s allocated=%s",
+        reserved_before,
+        torch.cuda.memory_reserved(),
+        torch.cuda.memory_allocated(),
+    )
+    finalize_model_grads(*args, **kwargs)
+
+
 def train_one_step(
     args: Namespace,
     rollout_id: int,
@@ -1155,6 +1318,7 @@ def train_one_step(
                     "rollout_log_probs",
                     "max_seq_lens",
                     "sample_index_mask_sums",
+                    "pre_shifted_labels",
                     *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
@@ -1259,6 +1423,7 @@ def train_one_step(
                     model,
                     mtp_output_layer_calls=mtp_output_layer_calls,
                     gather_passthrough=not mtp_only,
+                    recompute_chunks=not mtp_only and getattr(args, "recompute_loss_function", False),
                 ) as lm_head_forward:
                     if use_indexer_replay:
                         with IndexerReplay.forward_stage():
@@ -1356,7 +1521,11 @@ def train_one_step(
     # Match Megatron's memory-level control. Reloaded NCCL groups may allocate
     # their buffers for the first time during gradient-norm reduction; release
     # unused forward/backward cache before those allocations, not after an OOM.
-    if getattr(args, "empty_unused_memory_level", 0) >= 1:
+    if (
+        getattr(args, "empty_unused_memory_level", 0) >= 1
+        or Envs.RELAX_QWEN38_EMPTY_CACHE_BEFORE_OPT
+        or (rollout_id == 0 and step_id == 0 and Envs.RELAX_FIRST_STEP_CUDA_CACHE_RELEASE)
+    ):
         memory_before = available_memory()
         device_module.empty_cache()
         logger.info("Optimizer cache release: before=%s after=%s", memory_before, available_memory())
@@ -1525,13 +1694,20 @@ def train(
             config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = (
         _finalize_model_grads_with_memory_release
-        if getattr(args, "empty_unused_memory_level", 0) >= 1
+        if getattr(args, "empty_unused_memory_level", 0) >= 1 or Envs.RELAX_QWEN38_EMPTY_CACHE_BEFORE_GRAD_SYNC
         else finalize_model_grads
     )
 
     pre_hook_enabled = False
     param_sync_func = None
     keep_forward_pre_hook_disabled = False
+    resident_overlap = resident_sft_param_overlap_enabled(args)
+    if resident_overlap:
+        if not getattr(args, "_relax_resident_sft_actor_verified", False) or has_conditional_branch_sync(model):
+            raise RuntimeError(
+                "Resident parameter overlap requires a verified SFT Actor with no active conditional sync"
+            )
+        pre_hook_enabled = bool(getattr(config, "_relax_resident_sft_hooks_ready", False))
     if args.reset_optimizer_states:
         if (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0
@@ -1564,7 +1740,7 @@ def train(
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
-    if should_disable_forward_pre_hook(args):
+    if should_disable_forward_pre_hook(args) and not pre_hook_enabled:
         disable_forward_pre_hook(model, param_sync=False)
         # Also remove param_sync_func temporarily so that sync calls made in
         # `forward_backward_func` are no-ops.
@@ -1629,27 +1805,29 @@ def train(
             # Enable forward pre-hook after training step has successfully run. All subsequent
             # forward passes will use the forward pre-hook / `param_sync_func` in
             # `forward_backward_func`.
-            if should_disable_forward_pre_hook(args) and not keep_forward_pre_hook_disabled:
+            if should_disable_forward_pre_hook(args) and not keep_forward_pre_hook_disabled and not pre_hook_enabled:
                 enable_forward_pre_hook(model)
                 config.param_sync_func = param_sync_func
                 pre_hook_enabled = True
+                if resident_overlap:
+                    config._relax_resident_sft_hooks_ready = True
 
         mtp_losses = None
+        mtp_acceptance = None
         mtp_loss_per_depth: list[float] = []
         if args.enable_mtp_training:
             from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 
             mtp_loss_scale = 1 / num_microbatches[step_id]
             tracker = MTPLossLoggingHelper.tracker
-            # mcore >= 0.19 renamed the tracker payload: the per-microbatch
-            # accumulator is now "loss_sums" (plus "num_tokens" in per-token mode)
-            # instead of "values", and the cross-rank reduction moved into
-            # MTPLossLoggingHelper.reduce_loss_in_tracker(), which repopulates
-            # "values" and handles both normalization modes. Older mcore exposes
-            # "values" directly with no such helper, so reduce by hand there.
+            # Newer MCore accumulates normalized losses in "loss_values" and
+            # reduces that tensor in place via reduce_metrics_in_tracker(). Older
+            # variants use either reduce_loss_in_tracker() or expose "values"
+            # directly, so retain both compatibility fallbacks.
             # Mirrors upstream MTPLossLoggingHelper.track_mtp_metrics.
-            mtp_losses = None
-            reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_loss_in_tracker", None)
+            reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_metrics_in_tracker", None)
+            if reduce_in_tracker is None:
+                reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_loss_in_tracker", None)
             if reduce_in_tracker is not None:
                 reduce_in_tracker()
             elif "values" in tracker:
@@ -1658,8 +1836,16 @@ def train(
                     torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
                 if tracker.get("avg_group") is not None:
                     torch.distributed.all_reduce(values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG)
-            # "values" is the reduced payload on both old and new mcore;
-            # "loss_values" is the compatibility slot used by older helpers.
+            # reduce_metrics_in_tracker above already reduces these counts.
+            # Calling it again would multiply both loss and counts by group size.
+            mtp_correct = tracker.get("correct_values")
+            mtp_total = tracker.get("total_values")
+            if mtp_correct is not None and mtp_total is not None:
+                total_predictions = float(mtp_total.sum())
+                if total_predictions > 0:
+                    mtp_acceptance = float(mtp_correct.sum()) / total_predictions
+            # The legacy payload is "values"; the renamed metrics tracker uses
+            # "loss_values".
             mtp_values = tracker.get("values")
             if mtp_values is None:
                 mtp_values = tracker.get("loss_values")
@@ -1667,7 +1853,10 @@ def train(
                 scaled = mtp_values * mtp_loss_scale
                 mtp_loss_per_depth = scaled.flatten().tolist()
                 mtp_losses = sum(mtp_loss_per_depth)
-                MTPLossLoggingHelper.clean_loss_in_tracker()
+                clean_tracker = getattr(MTPLossLoggingHelper, "clean_metrics_in_tracker", None)
+                if clean_tracker is None:
+                    clean_tracker = MTPLossLoggingHelper.clean_loss_in_tracker
+                clean_tracker()
 
                 # CI check: verify MTP loss is within expected bounds
                 if args.ci_test:
@@ -1698,6 +1887,8 @@ def train(
                 if len(mtp_loss_per_depth) > 1:
                     for _i, _v in enumerate(mtp_loss_per_depth, start=1):
                         log_dict[f"train/{role_tag}mtp_{_i}_loss"] = _v
+            if mtp_acceptance is not None:
+                log_dict[f"train/{role_tag}mtp_acceptance"] = mtp_acceptance
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
 
             for param_group_id, param_group in enumerate(optimizer.param_groups):
@@ -1712,7 +1903,7 @@ def train(
                     num_per_epoch * num_steps_per_rollout
                 )
             tracking_utils.log(args, log_dict, step_key="train/step")
-            tracking_utils.flush_metrics(args, accumulated_step_id)
+            tracking_utils.flush_metrics(args, accumulated_step_id, wait=False)
 
             if args.ci_test and not args.ci_disable_kl_checker:
                 if step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
@@ -1745,7 +1936,8 @@ def train(
                 ), f"grad norm mismatch: {grad_norm} != {expected_grad_norm}"
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
-    if pre_hook_enabled:
+    defer_resident_sync = resident_overlap and rollout_id + 1 < args.num_rollout
+    if pre_hook_enabled and not defer_resident_sync:
         # NOTE(wuhuan): Sync the latest distributed-optimizer parameters before exporting weights
         # to rollout engines. this is important for --overlap-grad-reduce --overlap-param-gather
         disable_forward_pre_hook(model, param_sync=True)

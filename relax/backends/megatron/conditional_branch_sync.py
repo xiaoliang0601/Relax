@@ -171,8 +171,35 @@ def _run_dummy_vision(model: torch.nn.Module, device: torch.device) -> torch.Ten
     return _sum_tensors(vision_model(hidden_states=dummy_data, grid_thw=dummy_grid_thw))
 
 
-def _attach_zero_dependency(output: torch.Tensor, dependency: torch.Tensor) -> torch.Tensor:
-    return output + dependency.to(dtype=output.dtype, device=output.device) * 0
+def _attach_zero_dependency(
+    output: torch.Tensor | tuple[torch.Tensor, torch.Tensor], dependency: torch.Tensor
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(output, torch.Tensor):
+        return output + dependency.to(dtype=output.dtype, device=output.device) * 0
+    if isinstance(output, tuple) and len(output) == 2 and all(isinstance(value, torch.Tensor) for value in output):
+        hidden_states, loss_mask = output
+        return _attach_zero_dependency(hidden_states, dependency), loss_mask
+    raise TypeError(
+        "Qwen3VL conditional branch sync expected a tensor or (output, loss_mask) tensor pair, "
+        f"got {type(output).__name__}"
+    )
+
+
+def disable_frozen_conditional_branch_sync(model: torch.nn.Module) -> None:
+    """Finalize the adapter after all provider and name-based freezing.
+
+    Qwen3VL's merger and DeepStack projections are children of vision_model. A
+    wholly frozen branch has no DDP parameter or gradient collective that
+    requires the extra cross-DP dummy forward. Keep the wrapper chain intact.
+    """
+    if not getattr(model, "_relax_conditional_branch_sync_installed", False):
+        return
+    if getattr(model, "_relax_conditional_branch_sync_specs", ()) != ("qwen3vl_vision",):
+        return
+    vision = getattr(model, "vision_model", None)
+    if vision is not None and not any(param.requires_grad for param in vision.parameters()):
+        model._relax_conditional_branch_sync_active = False
+        _rank0_log_info("Disabled conditional vision branch sync for the fully frozen vision/projection subtree.")
 
 
 def install_conditional_branch_sync(args: argparse.Namespace, model: torch.nn.Module) -> None:
@@ -185,6 +212,8 @@ def install_conditional_branch_sync(args: argparse.Namespace, model: torch.nn.Mo
 
     @functools.wraps(original_forward)
     def wrapped_forward(self, *forward_args, **forward_kwargs):
+        if not self._relax_conditional_branch_sync_active:
+            return original_forward(*forward_args, **forward_kwargs)
         device = _first_tensor_device(forward_args, forward_kwargs)
         local_active = _has_local_vision_input(forward_args, forward_kwargs)
         global_active = _dp_any(local_active, self.pg_collection.dp, device)
@@ -192,14 +221,13 @@ def install_conditional_branch_sync(args: argparse.Namespace, model: torch.nn.Mo
 
         output = original_forward(*forward_args, **forward_kwargs)
         if dependency is not None:
-            if not isinstance(output, torch.Tensor):
-                raise TypeError(f"Qwen3VL conditional branch sync expected tensor output, got {type(output).__name__}")
             output = _attach_zero_dependency(output, dependency)
         return output
 
     model._relax_conditional_branch_sync_original_forward = original_forward
     model._relax_conditional_branch_sync_specs = ("qwen3vl_vision",)
     model._relax_conditional_branch_sync_installed = True
+    model._relax_conditional_branch_sync_active = True
     model.forward = types.MethodType(wrapped_forward, model)
 
     _rank0_log_info("Installed Qwen3VL conditional vision branch sync.")

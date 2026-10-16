@@ -29,6 +29,7 @@ class _FakeProvider:
         self.bf16 = False
         self.params_dtype = None
         self.vision_dp_when_cp = False
+        self.qsa_indexer_loss_coeff = 0.0
 
     def finalize(self):
         self.finalized = True
@@ -58,6 +59,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
     transformer = types.ModuleType("megatron.core.transformer")
     spec_utils = types.ModuleType("megatron.core.transformer.spec_utils")
     transformer_config = types.ModuleType("megatron.core.transformer.transformer_config")
+    multi_token_prediction = types.ModuleType("megatron.core.transformer.multi_token_prediction")
     training = types.ModuleType("megatron.training")
     arguments = types.ModuleType("megatron.training.arguments")
     tokenizer_package = types.ModuleType("megatron.training.tokenizer")
@@ -93,6 +95,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
     gpt_layer_specs.get_gpt_layer_with_transformer_engine_spec = lambda *args, **kwargs: object()
     spec_utils.import_module = lambda path: object()
     transformer_config.TransformerConfig = _FakeTransformerConfig
+    multi_token_prediction.MultiTokenPredictionBlock = type("MultiTokenPredictionBlock", (torch.nn.Module,), {})
     arguments.core_transformer_config_from_args = lambda args: _FakeTransformerConfig()
     arguments.parse_args = lambda *args, **kwargs: None
     arguments.validate_args = lambda *args, **kwargs: None
@@ -112,6 +115,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
         "megatron.core.transformer": transformer,
         "megatron.core.transformer.spec_utils": spec_utils,
         "megatron.core.transformer.transformer_config": transformer_config,
+        "megatron.core.transformer.multi_token_prediction": multi_token_prediction,
         "megatron.training": training,
         "megatron.training.arguments": arguments,
         "megatron.training.tokenizer": tokenizer_package,
@@ -148,6 +152,7 @@ def _bridge_args(**overrides):
         "expert_tensor_parallel_size": 1,
         "variable_seq_lengths": True,
         "dsa_indexer_loss_coeff": None,
+        "qsa_indexer_loss_coeff": 0.0,
         "dsa_indexer_use_sparse_loss": None,
         "attention_softmax_in_fp32": True,
         "bias_dropout_fusion": True,
@@ -193,6 +198,28 @@ def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
 
 
+@pytest.mark.parametrize("num_sms", [None, 80])
+def test_bridge_provider_forwards_deepep_sm_count_before_finalize(
+    monkeypatch: pytest.MonkeyPatch, num_sms: int | None
+) -> None:
+    provider = _FakeProvider()
+    provider.moe_flex_dispatcher_num_sms = None
+    finalized_sms = []
+    monkeypatch.setattr(provider, "finalize", lambda: finalized_sms.append(provider.moe_flex_dispatcher_num_sms))
+    module, provider = _load_model_provider(monkeypatch, provider=provider)
+    args = _bridge_args(
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="deepep",
+        moe_flex_dispatcher_num_sms=num_sms,
+    )
+
+    model_provider = module.get_model_provider_func(args, role="actor")
+    model_provider(pre_process=True, post_process=True)
+
+    assert finalized_sms == [num_sms]
+    assert provider.moe_flex_dispatcher_num_sms == num_sms
+
+
 def test_bridge_provider_receives_vision_dp_when_cp(monkeypatch):
     module, provider = _load_model_provider(monkeypatch)
 
@@ -200,6 +227,15 @@ def test_bridge_provider_receives_vision_dp_when_cp(monkeypatch):
     model_provider(pre_process=True, post_process=True)
 
     assert provider.vision_dp_when_cp is True
+
+
+def test_bridge_provider_receives_qsa_indexer_loss_coeff(monkeypatch):
+    module, provider = _load_model_provider(monkeypatch)
+
+    model_provider = module.get_model_provider_func(_bridge_args(qsa_indexer_loss_coeff=0.01), role="actor")
+    model_provider(pre_process=True, post_process=True)
+
+    assert provider.qsa_indexer_loss_coeff == pytest.approx(0.01)
 
 
 def test_bridge_provider_maps_legacy_vision_dp_when_tp_to_cp(monkeypatch):

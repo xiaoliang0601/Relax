@@ -603,3 +603,11 @@ def test_should_use_sft_chunked(loss_type, chunked_flag, expected):
         sft_chunked_logits=chunked_flag,
     )
     assert should_use_sft_chunked(args) is expected
+
+
+def test_bypass_checkpoint_rejects_actual_deferred_wgrad_config():
+    model = _FakeBridgeVL()
+    model.language_model.output_layer.config = Namespace(defer_embedding_wgrad_compute=True)
+    with pytest.raises(ValueError, match="deferred embedding wgrad off in the model config"):
+        with _bypass_output_layer(model, recompute_chunks=True):
+            pass

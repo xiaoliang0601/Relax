@@ -31,16 +31,21 @@ def helper():
     return cls(SimpleNamespace(), Mock())
 
 
-def test_shutdown_cleans_pool_created_by_finishing_fetch(helper):
+@pytest.mark.parametrize("pool_exists", [False, True])
+def test_shutdown_cleans_pool_created_by_finishing_fetch(helper, pool_exists):
     shutdown = _load_node(
         "relax/backends/megatron/actor.py", "_shutdown_sft_train_prefetch", owner="MegatronTrainRayActor"
     )
     pool = Mock()
     future = Mock()
+    if pool_exists:
+        helper.pool = pool
 
     def finish_fetch(**kwargs):
         assert kwargs == {"wait": True, "cancel_futures": True}
         future.cancel.assert_called_once_with()
+        if pool_exists:
+            assert helper.pool is pool
         # A fetch already running cannot be cancelled and may still create
         # the lazy processor pool and publish its image features while joined.
         helper.pool = pool

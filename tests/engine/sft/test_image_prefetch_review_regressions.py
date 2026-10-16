@@ -72,7 +72,8 @@ def test_worker_capability_controls_hf_reference_transport(processor, supported)
         split.assert_not_called()
 
 
-def test_background_rebuild_defers_timer_writes_until_foreground_resolve(monkeypatch):
+@pytest.mark.parametrize("bounded", [False, True])
+def test_background_rebuild_defers_timer_writes_until_foreground_resolve(monkeypatch, bounded):
     main_thread = threading.get_ident()
     writes = []
 
@@ -107,9 +108,11 @@ def test_background_rebuild_defers_timer_writes_until_foreground_resolve(monkeyp
         SFT_IMAGE_REFS_FIELD="refs",
         extract_image_ref_descriptors=lambda raw: raw["refs"],
     )
-    helper = helper_class(SimpleNamespace(), lambda **kw: ([{"refs": [{}, None, {}]}, None], 0.1))
+    fetch_data = Mock(return_value=([{"refs": [{}, None, {}]}, None], 0.1))
+    helper = helper_class(SimpleNamespace(), fetch_data)
     helper.owns_vision = lambda model: True
     helper._ensure_pool = lambda: pool
+    fetch_options = {"stop_event": threading.Event(), "timeout_s": 5.0} if bounded else {}
     with ThreadPoolExecutor(max_workers=1) as executor:
         executor.submit(
             helper.fetch,
@@ -120,7 +123,17 @@ def test_background_rebuild_defers_timer_writes_until_foreground_resolve(monkeyp
             partition_id="sft_3",
             task_name="train",
             sampling_config={},
+            **fetch_options,
         ).result()
+    fetch_data.assert_called_once_with(
+        data_fields=[],
+        batch_size=3,
+        partition_id="sft_3",
+        task_name="train",
+        sampling_config={},
+        batch_index=0,
+        **fetch_options,
+    )
     assert len(pending) == 2
     assert writes == []
     batch = {"refs": [{}, None, {}], "multimodal_train_inputs": [{}, None, {}]}

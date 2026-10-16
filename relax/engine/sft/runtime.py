@@ -187,6 +187,45 @@ def should_bypass_main_output_layer(args: Namespace) -> bool:
     return getattr(args, "mtp_only_training", False) or should_use_sft_chunked(args)
 
 
+def resident_sft_param_overlap_enabled(args: Namespace) -> bool:
+    """Validate the opt-in resident SFT experiment before retaining gathers.
+
+    This first implementation excludes periodic weight readers. Actor-side
+    validation additionally checks there is no rollout manager/model swapping.
+    Explicit save/sleep boundaries still synchronize any pending parameters.
+    """
+    if not Envs.RELAX_SFT_RESIDENT_PARAM_OVERLAP:
+        return False
+    required = ("use_distributed_optimizer", "overlap_grad_reduce", "overlap_param_gather")
+    incompatible = (
+        "fully_async",
+        "hybrid",
+        "use_critic",
+        "keep_old_actor",
+        "enable_mtp_training",
+        "mtp_only_training",
+        "eval_prompt_data",
+        "eval_size",
+        "sft_predict_interval",
+        "save",
+        "save_hf",
+        "rotate_ckpt",
+        "debug_train_only",
+        "debug_rollout_only",
+        "custom_megatron_before_train_step_hook_path",
+    )
+    if not is_sft_mode(args) or any(not getattr(args, name, False) for name in required):
+        raise ValueError("Resident parameter overlap requires SFT and distributed optimizer with both overlap flags")
+    conflicts = [name for name in incompatible if getattr(args, name, None)]
+    if conflicts:
+        raise ValueError(f"Resident SFT parameter overlap does not support: {', '.join(conflicts)}")
+    if getattr(args, "moe_shared_expert_overlap", False) and not getattr(
+        args, "_relax_shared_expert_gate_ready_verified", False
+    ):
+        raise ValueError("Shared resident overlap requires verified gate parameter readiness")
+    return True
+
+
 def should_use_sft_chunked(args: Namespace) -> bool:
     """Return whether regular SFT explicitly enabled chunked language-model
     logits."""

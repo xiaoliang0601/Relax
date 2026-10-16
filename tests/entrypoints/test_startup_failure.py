@@ -407,3 +407,46 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
     ns["shutdown"](partial_controller)
     stop_teacher.assert_called_once_with(teacher)
     stop_routers.assert_called_once()
+
+
+@pytest.mark.parametrize("finish_error", [False, True])
+def test_train_finishes_tracking_before_serve_cleanup(finish_error):
+    ns = _train_namespace()
+    events = []
+    ns["_ctrl"] = SimpleNamespace(_metrics_service_enabled=True, shutdown=lambda: events.append("controller"))
+
+    def finish(*, timeout_s):
+        assert timeout_s == 600
+        events.append("metrics")
+        if finish_error:
+            raise TimeoutError("reporter did not finish")
+        return {"status": "success"}
+
+    ns["serve"].get_app_handle.return_value.finish_tracking.remote.return_value.result.side_effect = finish
+    ns["serve"].shutdown.side_effect = lambda: events.append("serve")
+    ns["ray"].shutdown.side_effect = lambda: events.append("ray")
+    ns["_hard_exit"] = lambda code: events.append(("exit", code))
+    ns["_graceful_shutdown"](exit_code=0)
+    assert events == ["controller", "metrics", "serve", "ray", ("exit", 0)]
+    ns["serve"].get_app_handle.assert_called_once_with("metrics")
+
+
+@pytest.mark.parametrize("exit_code", [1, 143])
+def test_failed_training_does_not_finish_tracking_as_success(exit_code):
+    ns = _train_namespace()
+    ns["_ctrl"] = SimpleNamespace(_metrics_service_enabled=True, shutdown=Mock())
+    ns["_hard_exit"] = Mock()
+    ns["_graceful_shutdown"](exit_code=exit_code)
+    ns["serve"].get_app_handle.assert_not_called()
+    ns["serve"].shutdown.assert_called_once()
+    ns["ray"].shutdown.assert_called_once()
+
+
+def test_health_managed_return_does_not_prove_tracking_success():
+    ns = _train_namespace()
+    ns["_ctrl"] = SimpleNamespace(_metrics_service_enabled=True, _health_check_enabled=True, shutdown=Mock())
+    ns["_hard_exit"] = Mock()
+    ns["_graceful_shutdown"](exit_code=0)
+    ns["serve"].get_app_handle.assert_not_called()
+    ns["serve"].shutdown.assert_called_once()
+    ns["ray"].shutdown.assert_called_once()

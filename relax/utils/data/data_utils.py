@@ -573,14 +573,15 @@ def filter_long_prompts(
         actual_workers = min(multiprocessing.cpu_count(), len(samples), 8) if num_workers <= 0 else num_workers
 
         if actual_workers > 1 and len(samples) > 1:
-            filtered_samples = []
+            retained_samples: dict[int, Sample] = {}
             with ProcessPoolExecutor(
                 max_workers=actual_workers,
                 initializer=_init_check_length_worker,
                 initargs=(tokenizer, processor, apply_chat_template_kwargs),
             ) as executor:
                 futures = {
-                    executor.submit(_check_sample_length_worker, sample, max_length): sample for sample in samples
+                    executor.submit(_check_sample_length_worker, sample, max_length): index
+                    for index, sample in enumerate(samples)
                 }
                 for future in tqdm.tqdm(
                     futures,
@@ -590,12 +591,15 @@ def filter_long_prompts(
                     try:
                         sample, is_valid = future.result()
                         if is_valid:
-                            filtered_samples.append(sample)
+                            retained_samples[futures[future]] = sample
                         else:
                             logger.debug(f"Filtered sample exceeding max_length={max_length}")
                     except Exception as e:
                         logger.warning(f"Error checking sample length: {e}")
-                        filtered_samples.append(futures[future])
+                        index = futures[future]
+                        retained_samples[index] = samples[index]
+            # Worker completion order must not change the input to seeded shuffle.
+            filtered_samples = [retained_samples[index] for index in sorted(retained_samples)]
         else:
             filtered_samples = []
             for sample in tqdm.tqdm(samples, desc="check sample length..."):

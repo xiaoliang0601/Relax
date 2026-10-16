@@ -89,6 +89,16 @@ def test_preference_rows_expand_before_generic_rollout_post_processing(monkeypat
     assert rollout_data["preference_pair_costs"] == [5]
 
 
+def test_sft_pre_shifted_labels_field_is_opt_in(monkeypatch):
+    from relax.utils.training.data_fields import build_data_fields
+
+    args = _mk_actor_args(loss_type="sft")
+    assert "pre_shifted_labels" not in build_data_fields(args)
+
+    monkeypatch.setenv("RELAX_SFT_PRE_SHIFTED_LABELS", "1")
+    assert "pre_shifted_labels" in build_data_fields(args)
+
+
 def test_sequence_classification_sft_requests_classification_labels():
     from relax.utils.training.data_fields import build_data_fields
 

@@ -288,3 +288,70 @@ def test_loss_function_exports_effective_tokens_independent_of_metric_denominato
 
     assert logging["num_tokens"].item() == (0 if is_dummy else 2)
     assert logging["values"][0].item() == (2 if calculate_per_token_loss and not is_dummy else 0)
+
+
+@pytest.mark.parametrize("true_on_policy", [False, True])
+@pytest.mark.parametrize("custom_tis_path", [None, "custom.reject_tokens", "custom.icepop_function"])
+def test_policy_loss_mismatch_metrics_preserve_grpo_loss_and_gradient(monkeypatch, true_on_policy, custom_tis_path):
+    log_probs = torch.tensor([-0.7, -0.4, -0.2], dtype=torch.float64, requires_grad=True)
+    rollout_log_probs = log_probs.detach() - torch.tensor([1.5, -1.0, 0.2], dtype=torch.float64)
+    mask = torch.tensor([1.0, 1.0, 0.0], dtype=torch.float64)
+    monkeypatch.setattr(
+        loss_module,
+        "get_log_probs_and_entropy",
+        lambda *_args, **_kwargs: (
+            None,
+            {"log_probs": [log_probs], "entropy": [torch.zeros_like(log_probs)]},
+        ),
+    )
+    monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **_kwargs: (None, {}))
+
+    def forbidden_correction(*_args, **_kwargs):
+        raise AssertionError("Mismatch observation must not invoke a correction or rebuild its reducer")
+
+    monkeypatch.setattr(loss_module, "load_function", forbidden_correction)
+    monkeypatch.setattr(loss_module, "get_sum_of_sample_mean", forbidden_correction)
+    args = SimpleNamespace(
+        advantage_estimator="grpo",
+        true_on_policy_mode=true_on_policy,
+        use_rollout_logprobs=False,
+        use_opsm=False,
+        get_mismatch_metrics=False,
+        use_tis=False,
+        custom_tis_function_path=custom_tis_path,
+        tis_clip_low=0.5,
+        tis_clip=2.0,
+        eps_clip=0.2,
+        eps_clip_high=0.28,
+        custom_pg_loss_reducer_function_path=None,
+        entropy_coef=0.0,
+        use_kl_loss=False,
+    )
+    batch = {
+        "advantages": torch.tensor([1.0, -0.5, 2.0], dtype=torch.float64),
+        "rollout_log_probs": [rollout_log_probs],
+        "response_lengths": [3],
+        "total_lengths": [4],
+        "unconcat_tokens": [torch.arange(4)],
+        "loss_masks": [mask],
+    }
+    if not true_on_policy:
+        batch["log_probs"] = [log_probs.detach().clone()]
+
+    def run_loss():
+        return loss_module.policy_loss_function(
+            args, batch, logits=torch.empty(1, 1, 1), sum_of_sample_mean=lambda values: (values * mask).sum()
+        )
+
+    baseline, _ = run_loss()
+    baseline_gradient = torch.autograd.grad(baseline, log_probs)[0]
+    args.get_mismatch_metrics = True
+    observed, metrics = run_loss()
+    observed_gradient = torch.autograd.grad(observed, log_probs)[0]
+    torch.testing.assert_close(observed, baseline, rtol=0, atol=0)
+    torch.testing.assert_close(observed_gradient, baseline_gradient, rtol=0, atol=0)
+    delta = log_probs.detach() - rollout_log_probs
+    torch.testing.assert_close(metrics["mismatch_k3_kl"], ((delta.exp() - delta - 1) * mask).sum())
+    torch.testing.assert_close(metrics["tis_clipfrac"], mask.sum())
+    assert not metrics["mismatch_k3_kl"].requires_grad

@@ -32,6 +32,7 @@ def compute_sft_eval_step(
     with_entropy: bool = False,  # noqa: ARG001 — signature parity with get_log_probs_and_entropy
     max_seq_lens=None,
     padded_total_lengths=None,
+    cp_output_is_zigzag: bool = False,
     loss_masks=None,
     dynamic_cp_size=None,
     dynamic_cp_rank=None,
@@ -61,6 +62,7 @@ def compute_sft_eval_step(
         with_entropy=False,
         max_seq_lens=max_seq_lens,
         padded_total_lengths=padded_total_lengths,
+        cp_output_is_zigzag=cp_output_is_zigzag,
         dynamic_cp_size=dynamic_cp_size,
         dynamic_cp_rank=dynamic_cp_rank,
     )

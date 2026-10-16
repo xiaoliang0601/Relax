@@ -91,6 +91,22 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
                 logger.warning(f"Controller shutdown error during {sig_name}: {e}")
 
         if ray.is_initialized():
+            # Health-managed services may return while recovery is starting;
+            # exit 0 alone does not prove that their requested steps completed.
+            if (
+                sig is None
+                and exit_code == 0
+                and getattr(_ctrl, "_metrics_service_enabled", False)
+                and not getattr(_ctrl, "_health_check_enabled", False)
+            ):
+                try:
+                    result = serve.get_app_handle("metrics").finish_tracking.remote().result(timeout_s=600)
+                    if result.get("status") != "success":
+                        logger.warning(f"Tracking finalization reported an error: {result}")
+                except Exception as error:
+                    # Tracking must not prevent GPU/Serve cleanup. Only normal
+                    # completion closes tracking tasks as successful.
+                    logger.warning(f"Tracking finalization failed: {error}")
             try:
                 serve.shutdown()
                 if _kernel_cache_heartbeat is not None:

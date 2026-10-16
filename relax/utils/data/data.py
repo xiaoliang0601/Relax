@@ -132,3 +132,40 @@ def get_first_fit_partitions(total_lengths: list[int], max_tokens_per_gpu: int) 
 
 def get_minimum_num_micro_batch_size(total_lengths: list[int], max_tokens_per_gpu: int) -> int:
     return len(get_first_fit_partitions(total_lengths, max_tokens_per_gpu))
+
+
+def get_binpack_partitions(total_lengths, max_tokens_per_gpu):
+    """Worst-fit-decreasing bin packing, matching ms-swift's
+    ``packing_strategy="binpack"``.
+
+    ms-swift delegates packing to ``binpacking.to_constant_volume``, which sorts
+    items by descending length and drops each into the *least loaded* bin it still
+    fits in, opening a new bin only when none has room.
+
+    Differs from the two existing helpers in ways that matter for cross-framework
+    comparison: unlike :func:`relax.utils.data.seqlen_balancing.get_seqlen_balanced_partitions`
+    (Karmarkar-Karp) every bin respects ``max_tokens_per_gpu`` except an oversized singleton,
+    and unlike :func:`get_minimum_num_micro_batch_size` (plain first-fit, input
+    order) it returns the assignment rather than just the count.
+
+    Packing is local to each Relax update. The cross-update rolling window
+    used by ms-swift is not replicated here.
+
+    Returns a list of bins, each a sorted list of indices into ``total_lengths``.
+    """
+    bin_sums: list[int] = []
+    bins: list[list[int]] = []
+    # Stable descending sort, matching binpacking's revargsort tie-breaking.
+    for index in sorted(range(len(total_lengths)), key=lambda i: -total_lengths[i]):
+        length = total_lengths[index]
+        candidates = [b for b in range(len(bin_sums)) if bin_sums[b] + length <= max_tokens_per_gpu]
+        if candidates:
+            # Least-loaded fit. min() keeps the lowest index on ties, like argmin.
+            target = min(candidates, key=lambda b: bin_sums[b])
+        else:
+            bin_sums.append(0)
+            bins.append([])
+            target = len(bins) - 1
+        bin_sums[target] += length
+        bins[target].append(index)
+    return [sorted(current_bin) for current_bin in bins]

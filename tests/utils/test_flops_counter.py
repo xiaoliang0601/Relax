@@ -6,7 +6,13 @@ import types
 
 import pytest
 
-from relax.utils.training.flops_counter import _DEVICE_FLOPS, FlopsCounter, get_device_peak_flops
+from relax.utils.training.flops_counter import (
+    _DEVICE_FLOPS,
+    FlopsCounter,
+    _qwen38_indexer_pairs,
+    _qwen38_selected_pairs,
+    get_device_peak_flops,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -368,3 +374,251 @@ def test_unknown_model_type_missing_fields_returns_zero():
     counter = FlopsCounter(config)
     estimated, _ = counter.estimate([1024, 2048], delta_time=1.0)
     assert estimated == 0
+
+
+@pytest.fixture
+def qwen38_config():
+    # Published 48-layer text dimensions; vision uses the existing Qwen3.5 fixture.
+    return Config(
+        {
+            "model_type": "qwen4_exp",
+            "text_config": {
+                "model_type": "qwen4_exp_text",
+                "hidden_size": 2560,
+                "vocab_size": 248320,
+                "num_hidden_layers": 48,
+                "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 12,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "num_experts": 512,
+                "num_experts_per_tok": 10,
+                "moe_intermediate_size": 640,
+                "shared_expert_intermediate_size": 640,
+                "linear_num_key_heads": 16,
+                "linear_key_head_dim": 128,
+                "linear_num_value_heads": 48,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "indexer_budget": 2048,
+                "indexer_compress_ratio": 4,
+                "indexer_n_heads": 4,
+                "indexer_kv_heads": 1,
+                "indexer_head_dim": 128,
+                "hc_count": 4,
+                "hc_lowrank": 320,
+                "ple_layer_ids": [2],
+                "ple_embed_dim": 2560,
+                "ple_conv_kernel_size": 4,
+                "mtp": {"layer_types": ["full_attention"]},
+            },
+            "vision_config": {
+                **FLOPS_TEST_VL_CONFIGS["qwen3_5"]["config"]["vision_config"],
+                "out_hidden_size": 2560,
+            },
+        }
+    )
+
+
+_QWEN38_POLICY = {
+    "freeze_params_name_list": [r"(^|\.)per_layer_embedding\.|self_attention\.indexer\."],
+    "freeze_vision_model": True,
+    "freeze_vision_projection": True,
+}
+_QWEN38_MTP = {"enable_mtp_training": True, "mtp_num_layers": 1, "mtp_detach_paths": ()}
+_QWEN38_TABLE_ONLY_POLICY = {
+    **_QWEN38_POLICY,
+    "freeze_params_name_list": [
+        r"self_attention\.indexer\.",
+        r"(^|\.)per_layer_embedding\.ple_embedding\.ngram_embedding\.weight$",
+    ],
+}
+
+
+@pytest.mark.parametrize("budget,ratio", [(4, 1), (4, 2), (8, 4)])
+def test_qwen38_flops_sparse_pairs_match_causal_block_enumeration(budget, ratio):
+    for length in range(4 * budget + 1):
+        selected = indexer = 0
+        for position in range(1, length + 1):
+            full_blocks, tail = divmod(position, ratio)
+            selected += min(full_blocks, budget // ratio) * ratio + tail
+            if full_blocks > budget // ratio:
+                indexer += full_blocks
+        assert _qwen38_selected_pairs(length, budget, ratio) == selected
+        assert _qwen38_indexer_pairs(length, budget, ratio) == indexer
+
+
+@pytest.mark.parametrize("mtp_on,expected", [(False, 233.897266774016), (True, 261.24036079616)])
+@pytest.mark.parametrize("text_only,sparse_label", [(False, False), (True, True)])
+def test_flops_counter_qwen38_reference_and_mtp_golden(qwen38_config, mtp_on, expected, text_only, sparse_label):
+    text = qwen38_config.text_config
+    if sparse_label:
+        text.layer_types = ["qwen_sparse_attention" if t == "full_attention" else t for t in text.layer_types]
+        text.mtp = {"layer_types": ["qwen_sparse_attention"]}
+    counter = FlopsCounter(text if text_only else qwen38_config)
+    # Analytical reference: MTP1 adds 27.343094022144 TFLOPs for
+    # one QSA/MoE block, three HC mixers, two HC injections, e/h projections,
+    # and a full-token LM head. No vocabulary-sized embedding lookup GEMM.
+    policy = {**_QWEN38_POLICY, **(_QWEN38_MTP if mtp_on else {})}
+    result, _ = counter.estimate([512, 1024, 4096], delta_time=2.0, **policy)
+    assert result == pytest.approx(expected / 2)
+    doubled, _ = counter.estimate([512, 1024, 4096] * 2, delta_time=2.0, **policy)
+    assert doubled == pytest.approx(2 * result)  # No attention across packed document boundaries.
+
+
+def test_flops_counter_qwen38_frozen_vision_forward_cost(qwen38_config):
+    counter = FlopsCounter(qwen38_config)
+    baseline, _ = counter.estimate([1024], 1.0, **_QWEN38_POLICY)
+    with_image, _ = counter.estimate([1024], 1.0, images_seqlens=[256], **_QWEN38_POLICY)
+    # Frozen ViT: patch projection + 27 full-attention/GELU blocks + one merger.
+    expected = (
+        2 * 256 * 1152 * 3 * 2 * 16**2
+        + 27 * (2 * 256 * (4 * 1152**2 + 2 * 1152 * 4304) + 4 * 256**2 * 1152)
+        + 2 * 64 * ((4 * 1152) ** 2 + 4 * 1152 * 2560)
+    ) / 1e12
+    assert with_image - baseline == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("detach_embedding", [False, True])
+@pytest.mark.parametrize("detach_backbone", [False, True])
+@pytest.mark.parametrize("detach_head", [False, True])
+@pytest.mark.parametrize("head_tokens", [None, 1024])
+def test_flops_counter_qwen38_mtp_detach_paths(
+    qwen38_config, detach_embedding, detach_backbone, detach_head, head_tokens
+):
+    paths = tuple(
+        path
+        for path, detach in zip(("embedding", "backbone", "lm-head"), (detach_embedding, detach_backbone, detach_head))
+        if detach
+    )
+    policy = {**_QWEN38_POLICY, **_QWEN38_MTP, "mtp_detach_paths": paths}
+    if head_tokens is not None:
+        policy["lm_head_tokens"] = head_tokens
+    result, _ = FlopsCounter(qwen38_config).estimate([512, 1024, 4096], 2.0, **policy)
+    # Audited undetached golden; detach keeps e/h projection dInput because their
+    # input norms are trainable. Only the MTP head's [248320,2560] dWeight drops.
+    expected = 261.24036079616
+    if detach_head:
+        expected -= 2 * 2560 * 248320 * 5632 / 1e12
+    if head_tokens is not None:
+        # Main-head chunking never shortens the MTP projection's token count.
+        expected -= 6 * 2560 * 248320 * (5632 - head_tokens) / 1e12
+    assert result == pytest.approx(expected / 2)
+
+
+@pytest.mark.parametrize("paths", [(), [], "none", ("none",), ["none"]])
+def test_flops_counter_qwen38_mtp_no_detach_aliases(qwen38_config, paths):
+    policy = {**_QWEN38_POLICY, **_QWEN38_MTP, "mtp_detach_paths": paths}
+    result, _ = FlopsCounter(qwen38_config).estimate([512, 1024, 4096], 2.0, **policy)
+    assert result == pytest.approx(261.24036079616 / 2)
+
+
+def test_flops_counter_qwen38_mtp_default_detaches_all_paths(qwen38_config):
+    policy = {**_QWEN38_POLICY, "enable_mtp_training": True, "mtp_num_layers": 1}
+    counter = FlopsCounter(qwen38_config)
+    default, _ = counter.estimate([1024], 1.0, **policy)
+    explicit, _ = counter.estimate([1024], 1.0, mtp_detach_paths=["embedding", "backbone", "lm-head"], **policy)
+    assert default > 0
+    assert default == explicit
+
+
+@pytest.mark.parametrize("deepstack_layers", [[], [8, 16]])
+@pytest.mark.parametrize("explicit_trainable", [False, True])
+def test_flops_counter_qwen38_trainable_vision_backward_cost(qwen38_config, deepstack_layers, explicit_trainable):
+    qwen38_config.vision_config.deepstack_visual_indexes = deepstack_layers
+    counter = FlopsCounter(qwen38_config)
+    policy = {"freeze_params_name_list": _QWEN38_POLICY["freeze_params_name_list"]}
+    if explicit_trainable:
+        policy.update(freeze_vision_model=False, freeze_vision_projection=False)
+    baseline, _ = counter.estimate([1024], 2.0, **policy)
+    trained, _ = counter.estimate([1024], 2.0, images_seqlens=[256, 64], **policy)
+    frozen, _ = counter.estimate([1024], 2.0, images_seqlens=[256, 64], **_QWEN38_POLICY)
+    # Two independent images: patch Conv3d has fwd+dWeight (no pixel dInput),
+    # 27 attention/GELU blocks and each merger have fwd+dInput+dWeight.
+    patch = 320 * 1152 * 3 * 2 * 16**2
+    blocks = 27 * 320 * (4 * 1152**2 + 2 * 1152 * 4304)
+    attention = 27 * 1152 * (256**2 + 64**2)
+    mergers = (1 + len(deepstack_layers)) * 80 * ((4 * 1152) ** 2 + 4 * 1152 * 2560)
+    expected = (4 * patch + 6 * blocks + 12 * attention + 6 * mergers) / 2 / 1e12
+    backward = (2 * patch + 4 * blocks + 8 * attention + 4 * mergers) / 2 / 1e12
+    assert baseline > 0
+    assert trained - baseline == pytest.approx(expected)
+    assert trained - frozen == pytest.approx(backward)
+
+
+@pytest.mark.parametrize("mtp_on", [False, True])
+@pytest.mark.parametrize("ple_layers", [[2], [2, 6]])
+def test_flops_counter_qwen38_table_only_freeze_adds_weight_gradients(qwen38_config, mtp_on, ple_layers):
+    qwen38_config.text_config.ple_layer_ids = ple_layers
+    counter = FlopsCounter(qwen38_config)
+    mtp = _QWEN38_MTP if mtp_on else {}
+    frozen, _ = counter.estimate([512, 1024, 4096], 2.0, **_QWEN38_POLICY, **mtp)
+    table_only, _ = counter.estimate([512, 1024, 4096], 2.0, **_QWEN38_TABLE_ONLY_POLICY, **mtp)
+    # Each PLE adds dWeight for key [10240,2560], value [2560,2560]
+    # and depthwise conv [10240,1,4]. Lookup outputs are frozen, so no
+    # projection dInput matmul; norms remain excluded elementwise operations.
+    extra_flops_per_token = 2 * (10240 * 2560 + 2560 * 2560 + 10240 * 4)
+    expected_delta = len(ple_layers) * (512 + 1024 + 4096) * extra_flops_per_token / 2 / 1e12
+    assert frozen > 0
+    assert table_only - frozen == pytest.approx(expected_delta)
+
+
+@pytest.mark.parametrize("mtp_on", [False, True])
+@pytest.mark.parametrize("unmatched_pattern", [[], [r"per_layer_embedding\.weight$"]])
+def test_flops_counter_qwen38_unfrozen_table_adds_projection_input_gradients(qwen38_config, mtp_on, unmatched_pattern):
+    counter = FlopsCounter(qwen38_config)
+    mtp = _QWEN38_MTP if mtp_on else {}
+    frozen_table, _ = counter.estimate([512, 1024, 4096], 2.0, **_QWEN38_TABLE_ONLY_POLICY, **mtp)
+    policy = {**_QWEN38_POLICY, "freeze_params_name_list": [r"self_attention\.indexer\.", *unmatched_pattern]}
+    unfrozen, _ = counter.estimate([512, 1024, 4096], 2.0, **policy, **mtp)
+    # dInput for key/value projections; lookup scatter-add is not a dense matmul.
+    expected_delta = (512 + 1024 + 4096) * 2 * (10240 * 2560 + 2560 * 2560) / 2 / 1e12
+    assert frozen_table > 0
+    assert unfrozen - frozen_table == pytest.approx(expected_delta)
+
+
+@pytest.mark.parametrize(
+    "extra_freeze",
+    [
+        r"per_layer_embedding\.key_proj\.weight$",
+        r"per_layer_embedding\.value_proj\.weight$",
+        r"per_layer_embedding\.norm_key\.weight$",
+        r"per_layer_embedding\.norm_query\.weight$",
+        r"per_layer_embedding\.norm_conv\.weight$",
+        r"per_layer_embedding\.conv1d\.weight$",
+        r"language_model\.decoder\.layers\.1\.per_layer_embedding\.key_proj\.weight$",
+    ],
+)
+def test_flops_counter_qwen38_rejects_partial_ple_branch_freeze(qwen38_config, extra_freeze):
+    policy = {
+        **_QWEN38_TABLE_ONLY_POLICY,
+        "freeze_params_name_list": [*_QWEN38_TABLE_ONLY_POLICY["freeze_params_name_list"], extra_freeze],
+    }
+    result, _ = FlopsCounter(qwen38_config).estimate([1024], 1.0, **policy)
+    assert result == 0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"freeze_params_name_list": []},
+        {"freeze_vision_model": False},
+        {"freeze_vision_projection": False},
+        {"mtp_num_layers": 2},
+        {"mtp_detach_paths": ("embedding", "hidden")},
+        {"mtp_detach_paths": ("none", "lm-head")},
+        {"mtp_detach_paths": None},
+        {"mtp_only_training": True},
+        {"freeze_params_name_list": [r"per_layer_embedding\.", r"^decoder.*self_attention\.indexer\."]},
+    ],
+)
+def test_flops_counter_qwen38_rejects_unaudited_policies(qwen38_config, overrides):
+    policy = {**_QWEN38_POLICY, **_QWEN38_MTP, **overrides}
+    result, _ = FlopsCounter(qwen38_config).estimate([1024], 1.0, images_seqlens=[256], **policy)
+    assert result == 0
+
+
+def test_flops_counter_qwen38_rejects_invalid_compression(qwen38_config):
+    qwen38_config.text_config.indexer_budget = 7
+    with pytest.raises(ValueError, match="divisible"):
+        FlopsCounter(qwen38_config).estimate([1024], 1.0, **_QWEN38_POLICY)

@@ -1,0 +1,27 @@
+--- a/flash_attn/cute/interface.py
++++ b/flash_attn/cute/interface.py
+@@ -2831,7 +2831,15 @@
+ 
+     gather_kv_indices: used for topk sparsity with MLA absorption kernel.
+     """
+-    return FlashAttnVarlenFunc.apply(
++    # Qwen3.8 vision uses 72-dim heads. FA4's SM100 backward does not
++    # correctly handle this padded dimension; retain FA4 with a supported
++    # 128-dim tile. Preserve the original scale and autograd through padding.
++    pad_head72 = qv is None and q.shape[-1] == k.shape[-1] == v.shape[-1] == 72
++    if pad_head72:
++        if softmax_scale is None:
++            softmax_scale = q.shape[-1] ** -0.5
++        q, k, v = [torch.nn.functional.pad(x, (0, 56)) for x in (q, k, v)]
++    out, lse = FlashAttnVarlenFunc.apply(
+         q,
+         k,
+         v,
+@@ -2861,6 +2869,7 @@
+         aux_scalars,
+         return_lse,
+     )
++    return (out[..., :72].contiguous() if pad_head72 else out), lse
+ 
+ 
+ def _compile_fwd_combine(

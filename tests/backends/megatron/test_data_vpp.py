@@ -35,7 +35,8 @@ def _load_data_module(monkeypatch):
     monkeypatch.setattr(importlib.import_module("relax.utils"), "tracking_utils", tracking_utils, raising=False)
 
     class _PackedSeqParams:
-        pass
+        def __init__(self, **kwargs):
+            vars(self).update(kwargs)
 
     core.mpu = mpu
     packed_seq_params.PackedSeqParams = _PackedSeqParams
@@ -129,6 +130,133 @@ def test_seqlen_partitions_respect_capacity(
     assert not dummy_offsets
     if not expect_fallback:
         assert partitions == kk_partitions
+
+
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize("loss_coeff", [None, 0.0, 0.01])
+def test_vl_packed_stage2_preserves_true_lengths_without_changing_cu(
+    monkeypatch, cp_size: int, loss_coeff: float | None
+):
+    data_module = _load_data_module(monkeypatch)
+    monkeypatch.setattr(data_module, "get_args", lambda: Namespace(qsa_indexer_loss_coeff=loss_coeff))
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: cp_size, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 2, raising=False)
+
+    def slice_with_cp(tokens, pad_value, *_args, **_kwargs):
+        if cp_size == 1:
+            return tokens
+        chunk = (tokens.size(0) + 3) // 4
+        padded = torch.nn.functional.pad(tokens, (0, 4 * chunk - tokens.size(0)), value=pad_value)
+        return torch.cat((padded[:chunk], padded[3 * chunk :]))
+
+    monkeypatch.setattr(data_module, "slice_with_cp", slice_with_cp)
+    batch = {
+        "tokens": [torch.arange(5), torch.arange(2)],
+        "loss_masks": [torch.ones(5, dtype=torch.int), torch.ones(2, dtype=torch.int)],
+        "total_lengths": [5, 2],
+        "response_lengths": [5, 2],
+    }
+    packed = data_module.get_batch(iter([(batch, None)]), ["tokens"], pad_multiplier=4, is_vl_model=True)
+    params = packed["vlm_packed_seq_params"] if cp_size == 2 else packed["packed_seq_params"]
+    assert packed.get("cp_output_is_zigzag", False) == (cp_size > 1)
+
+    if cp_size == 2:
+        assert params.cu_seqlens_q.tolist() == [0, 8, 16]
+        assert params.cu_seqlens_q_padded.tolist() == [0, 8, 16]
+        expected_lengths = [5, 2]
+        expected_starts = (0, 8, 16)
+    else:
+        assert params.cu_seqlens_q.tolist() == [0, 5, 7, 8]
+        expected_lengths = [5, 2, 0]
+        expected_starts = (0, 5, 7, 8)
+    assert params.qsa_select_offsets_cpu == expected_starts
+    if loss_coeff is not None and loss_coeff > 0:
+        assert params.qsa_stage2_valid_lengths.tolist() == expected_lengths
+        assert params.qsa_stage2_layout_cpu == (expected_starts, tuple(expected_lengths))
+    else:
+        assert not hasattr(params, "qsa_stage2_valid_lengths")
+        assert not hasattr(params, "qsa_stage2_layout_cpu")
+
+
+def test_vl_cp_packing_keeps_two_image_samples_and_loss_masks_separate(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    monkeypatch.setattr(data_module, "get_args", lambda: Namespace(qsa_indexer_loss_coeff=0.0))
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: 2, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 2, raising=False)
+
+    def slice_with_cp(values, pad_value, *_args, **_kwargs):
+        chunk = (values.size(0) + 3) // 4
+        padded = torch.nn.functional.pad(values, (0, 4 * chunk - values.size(0)), value=pad_value)
+        return torch.cat((padded[:chunk], padded[3 * chunk :]))
+
+    monkeypatch.setattr(data_module, "slice_with_cp", slice_with_cp)
+    lengths = [92, 99]
+    tokens = [torch.full((length,), 10 + i, dtype=torch.long) for i, length in enumerate(lengths)]
+    loss_masks = [torch.arange(length) >= length - (i + 2) for i, length in enumerate(lengths)]
+    batch = {
+        "tokens": tokens,
+        "loss_masks": loss_masks,
+        "total_lengths": lengths,
+        "response_lengths": lengths,
+        "multimodal_train_inputs": [
+            {
+                "pixel_values": torch.full((4, 3), 1.0),
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            },
+            {
+                "pixel_values": torch.full((9, 3), 2.0),
+                "image_grid_thw": torch.tensor([[1, 3, 3]]),
+            },
+        ],
+    }
+
+    packed = data_module.get_batch(iter([(batch, None)]), ["tokens"], pad_multiplier=4, is_vl_model=True)
+
+    assert packed["padded_total_lengths"] == [96, 104]
+    assert packed["vlm_packed_seq_params"].cu_seqlens_q.tolist() == [0, 96, 200]
+    assert packed["unsplit_attention_mask"].sum(dim=1).tolist() == lengths
+    assert packed["multimodal_num_items"]["pixel_values"] == [4, 9]
+    assert packed["multimodal_num_items"]["image_grid_thw"] == [1, 1]
+    assert packed["multimodal_train_inputs"]["image_grid_thw"].tolist() == [[1, 2, 2], [1, 3, 3]]
+    assert packed["multimodal_train_inputs"]["pixel_values"][:4].eq(1).all()
+    assert packed["multimodal_train_inputs"]["pixel_values"][4:].eq(2).all()
+    assert packed["unsplit_tokens"][0, : lengths[0]].eq(10).all()
+    assert packed["unsplit_tokens"][1, : lengths[1]].eq(11).all()
+    assert packed["full_loss_masks"].sum().item() == sum(i + 2 for i in range(2))
+
+
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize("loss_coeff", [0.0, 0.01])
+def test_allgather_packed_stage2_layout_keeps_last_document_padding(monkeypatch, cp_size: int, loss_coeff: float):
+    data_module = _load_data_module(monkeypatch)
+    monkeypatch.setattr(data_module, "get_args", lambda: Namespace(qsa_indexer_loss_coeff=loss_coeff))
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: cp_size, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 2, raising=False)
+    batch = {
+        "tokens": [torch.arange(5), torch.arange(2)],
+        "loss_masks": [torch.ones(5, dtype=torch.int), torch.ones(2, dtype=torch.int)],
+        "total_lengths": [5, 2],
+        "response_lengths": [5, 2],
+    }
+
+    if loss_coeff > 0 and cp_size > 1:
+        with pytest.raises(NotImplementedError, match="per-document zigzag"):
+            data_module.get_batch(iter([(batch, None)]), ["tokens"], pad_multiplier=4, allgather_cp=True)
+        return
+
+    packed = data_module.get_batch(iter([(batch, None)]), ["tokens"], pad_multiplier=4, allgather_cp=True)
+    params = packed["packed_seq_params"]
+    assert params.cu_seqlens_q.tolist() == [0, 5, 7]
+    assert params.cu_seqlens_q_padded.tolist() == [0, 5, 8 * cp_size]
+    assert params.qsa_select_offsets_cpu == (0, 5, 8 * cp_size)
+    assert params.cu_seqlens_q_cpu == [0, 5, 7]
+    if loss_coeff > 0:
+        assert params.qsa_stage2_layout_cpu == ((0, 5, 8), (5, 2))
+    else:
+        assert not hasattr(params, "qsa_stage2_layout_cpu")
 
 
 def test_rollout_minibatch_plan_derives_from_global_batch(monkeypatch):
@@ -415,3 +543,76 @@ def test_gather_multimodal_metrics_weights_dp_samples_and_preserves_extrema(monk
     assert result["rollout/image_count/mean"] == pytest.approx(4 / 3)
     assert result["rollout/image_count/max"] == 3
     assert logged == [result]
+
+
+@pytest.mark.parametrize("strategy", ["balanced", "binpack"])
+def test_vl_cp_dynamic_packing_budgets_per_document_padding(monkeypatch, strategy):
+    data_module = _load_data_module(monkeypatch)
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_world_size", lambda **_: 1, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_group", lambda: object(), raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: 2, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 2, raising=False)
+    monkeypatch.setattr(data_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(data_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
+    args = Namespace(
+        sft_packing_strategy=strategy,
+        balance_data=False,
+        global_batch_size=3,
+        micro_batch_size=1,
+        use_dynamic_batch_size=True,
+        max_tokens_per_gpu=8,
+        allgather_cp=True,
+        data_pad_size_multiplier=4,
+        is_vl_model=True,
+        qkv_format="thd",
+        loss_type="sft",
+    )
+    monkeypatch.setattr(data_module, "get_args", lambda: args)
+    # Raw 5+5+5 fits 16, while Bridge actually needs 8+8+8 tokens.
+    rollout = {"total_lengths": [5, 5, 5]}
+    iterators, counts = data_module.get_data_iterator(args, object(), rollout)
+    assert counts == [2]
+    assert sorted(idx for batch in iterators[0].micro_batch_indices for idx in batch) == [0, 1, 2]
+    for batch in iterators[0].micro_batch_indices:
+        packed = data_module.get_batch(
+            iter(
+                [
+                    (
+                        {
+                            "tokens": [torch.arange(5) for _ in batch],
+                            "total_lengths": [5] * len(batch),
+                            "response_lengths": [5] * len(batch),
+                            "loss_masks": [torch.ones(5, dtype=torch.int) for _ in batch],
+                        },
+                        None,
+                    )
+                ]
+            ),
+            ["tokens"],
+            pad_multiplier=4,
+            is_vl_model=True,
+            allgather_cp=True,
+        )
+        assert packed["vlm_packed_seq_params"].cu_seqlens_q[-1] <= 16
+
+
+@pytest.mark.parametrize("extra_slots", [1, 3])
+def test_binpack_schedule_marks_extra_slots_as_dummy(monkeypatch, extra_slots):
+    data_module = _load_data_module(monkeypatch)
+    lengths = [6, 4, 3, 3]
+    real = data_module.get_binpack_partitions(lengths, 10)
+    partitions, dummy = data_module._get_seqlen_partitions_with_dummy_padding(
+        lengths, len(real) + extra_slots, 10, packing_strategy="binpack"
+    )
+    assert partitions[: len(real)] == real
+    assert dummy == set(range(len(real), len(partitions)))
+    assert sorted(i for j, part in enumerate(partitions) if j not in dummy for i in part) == list(range(len(lengths)))
+    assert all(sum(lengths[i] for i in part) <= 10 for part in partitions)
+
+
+def test_binpack_rejects_schedule_smaller_than_assignment(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    with pytest.raises(ValueError, match="synchronized count"):
+        data_module._get_seqlen_partitions_with_dummy_padding([6, 6], 1, 10, packing_strategy="binpack")

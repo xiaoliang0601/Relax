@@ -1,0 +1,13 @@
+--- a/transformer_engine/pytorch/attention/dot_product_attention/utils.py
++++ b/transformer_engine/pytorch/attention/dot_product_attention/utils.py
+@@ -458,6 +458,10 @@
+     use_flash_attention_2 = use_flash_attention and int(os.getenv("NVTE_FLASH_ATTN_V2", "1"))
+     use_flash_attention_3 = use_flash_attention and int(os.getenv("NVTE_FLASH_ATTN_V3", "1"))
+     use_flash_attention_4 = use_flash_attention and int(os.getenv("NVTE_FLASH_ATTN_V4", "1"))
++    # Qwen3.8 vision has 72-dim heads; leave language FA4 selection unchanged.
++    if os.getenv("RELAX_QWEN38_VISION_FA2", "0") == "1" and head_dim_qk == head_dim_v == 72:
++        use_flash_attention_3 = False
++        use_flash_attention_4 = False
+     flash_attention_backend = None
+     use_fused_attention = int(os.getenv("NVTE_FUSED_ATTN", "1"))
+     use_unfused_attention = int(os.getenv("NVTE_UNFUSED_ATTN", "1"))

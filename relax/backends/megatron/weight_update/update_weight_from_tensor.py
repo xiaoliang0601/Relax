@@ -69,6 +69,11 @@ class UpdateWeightFromTensor:
         self.weights_getter = weights_getter
         self.model_name = model_name
         self.quantization_config = quantization_config
+        # TRT-LLM BF16 MoE also packs weights after loading, just like the
+        # compressed-tensors path. Bracket the complete update, not each bucket.
+        self._needs_weight_repacking = (
+            quantization_config is not None and quantization_config["quant_method"] == "compressed-tensors"
+        ) or (quantization_config is None and getattr(args, "sglang_moe_runner_backend", None) == "flashinfer_trtllm")
         self.weight_version = 0
 
         self.lora_enabled = is_lora_enabled(args)
@@ -252,8 +257,9 @@ class UpdateWeightFromTensor:
 
         self.weight_version += 1
 
-        # Pause/flush must cover both IPC and distributed-broadcast engines,
-        # otherwise NCCL-path engines see torn reads and stale radix-KV cache.
+        # Pause/flush must cover both IPC and distributed-broadcast engines.
+        # Offloaded engines already flushed before releasing KV memory; another
+        # flush now would write into that still-unmapped KV pool.
         all_engines = list(self.rollout_engines) + list(self.distributed_rollout_engines)
 
         rank = dist.get_rank()
@@ -268,8 +274,9 @@ class UpdateWeightFromTensor:
             )
         elif rank == 0:
             ray.get([engine.pause_generation.remote() for engine in all_engines])
-            ray.get([engine.flush_cache.remote() for engine in all_engines])
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if not self.args.offload_rollout:
+                ray.get([engine.flush_cache.remote() for engine in all_engines])
+            if self._needs_weight_repacking:
                 post_process_weights(
                     restore_weights_before_load=True,
                     post_process_quantization=False,
@@ -351,7 +358,7 @@ class UpdateWeightFromTensor:
             self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
             self._routed_engine_call(all_engines, "continue_generation")
         elif rank == 0:
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if self._needs_weight_repacking:
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
@@ -432,8 +439,9 @@ class UpdateWeightFromTensor:
         rank = dist.get_rank()
         if rank == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if not self.args.offload_rollout:
+                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            if self._needs_weight_repacking:
                 post_process_weights(
                     restore_weights_before_load=True,
                     post_process_quantization=False,
@@ -481,7 +489,7 @@ class UpdateWeightFromTensor:
         dist.barrier(group=get_gloo_group())
 
         if rank == 0:
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if self._needs_weight_repacking:
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
@@ -531,7 +539,8 @@ class UpdateWeightFromTensor:
         rank = dist.get_rank()
         if rank == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            if not self.args.offload_rollout:
+                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
         push_error: Exception | None = None

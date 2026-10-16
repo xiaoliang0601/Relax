@@ -17,6 +17,7 @@ def compute_classification_eval_step(
     sample_weights=None,
     max_seq_lens=None,
     padded_total_lengths=None,
+    cp_output_is_zigzag: bool = False,
     dynamic_cp_size=None,
     dynamic_cp_rank=None,
     **_,
@@ -36,6 +37,7 @@ def compute_classification_eval_step(
         "response_lengths": response_lengths,
         "max_seq_lens": max_seq_lens,
         "padded_total_lengths": padded_total_lengths,
+        "cp_output_is_zigzag": cp_output_is_zigzag,
         "dynamic_cp_size": dynamic_cp_size,
         "dynamic_cp_rank": dynamic_cp_rank,
     }

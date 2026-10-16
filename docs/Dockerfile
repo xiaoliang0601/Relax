@@ -1,5 +1,5 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM artifactory.devops.xiaohongshu.com/media/node:20-alpine AS builder
+FROM node:20-alpine AS builder
 
 WORKDIR /app
 
@@ -26,7 +26,7 @@ COPY relax/ ./relax/
 RUN npm run docs:build
 
 # ── Stage 2: serve ────────────────────────────────────────────────────────────
-FROM artifactory.devops.xiaohongshu.com/media/nginx:1.27-alpine AS runner
+FROM nginx:1.27-alpine AS runner
 
 # Copy built site into the /Relax/ sub-path to match VitePress base: '/Relax/'
 RUN mkdir -p /usr/share/nginx/html/Relax && rm -rf /usr/share/nginx/html/index.html
