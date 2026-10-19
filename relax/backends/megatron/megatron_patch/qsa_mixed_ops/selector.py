@@ -39,17 +39,22 @@ def index_scores(query: Tensor, keys: Tensor) -> Tensor:
 
 
 @torch.compile(fullgraph=True, dynamic=True)
-def compiled_score_topk(query: Tensor, keys: Tensor, positions: Tensor, topk: int) -> Tensor:
-    """Fuse score postprocessing; keep the same FP32 GEMM output and sorted
-    top-k."""
-    rows, heads, dim = query.shape
-    scores = torch.mm(query.reshape(-1, dim), keys.T, out_dtype=torch.float32)
-    scores = scores.reshape(rows, heads, keys.shape[0]).transpose(1, 2)
+def _compiled_topk(scores: Tensor, positions: Tensor, topk: int) -> Tensor:
+    """Compile score postprocessing independently of the CUDA GEMM."""
     logits = scores.relu().sum(-1) / 128**0.5
-    visible = torch.arange(keys.shape[0], device=query.device)[None, :] < (positions[:, None] + 1) // 4
+    visible = torch.arange(scores.shape[1], device=scores.device)[None, :] < (positions[:, None] + 1) // 4
     logits = logits.masked_fill(~visible, -torch.inf)
-    values, ids = logits.topk(min(topk, keys.shape[0]), dim=-1)
+    values, ids = logits.topk(min(topk, scores.shape[1]), dim=-1)
     return ids.masked_fill(values == -torch.inf, -1).to(torch.int32)
+
+
+def compiled_score_topk(query: Tensor, keys: Tensor, positions: Tensor, topk: int) -> Tensor:
+    """Keep BF16-to-FP32 GEMM eager and compile the sorted top-k processing.
+
+    PyTorch versions without FakeTensor support for ``mm(out_dtype=...)`` can
+    execute the CUDA operation but cannot capture it in a compiled graph.
+    """
+    return _compiled_topk(index_scores(query, keys), positions, topk)
 
 
 def document_bounds(packed: Any, total: int) -> tuple[int, ...]:
