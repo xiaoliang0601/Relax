@@ -1,0 +1,28 @@
+{
+  "date": "2026-11-04",
+  "operator_source_commit": "d16f2e3ec45be059db6377295090b1d49257892c",
+  "nv_source_commit": "f4fa4747f7e48a436cf138023b321cef9b615e67",
+  "measurement_harness_file": "provenance/measured_runner.py.txt",
+  "measurement_harness_sha256": "a640338fdfc726e444a00168cd8aef6c07677705a695850ff1c978302404f802",
+  "reference_runs": [
+    {
+      "name": "h20-6q",
+      "file": "data/reference/h20_20261104/h20-6q.json.gz",
+      "uncompressed_sha256": "0e3f25c85164760f6d0680c7fea37062b322d4e2e186d781c64def58acf9a718",
+      "compressed_sha256": "b6cc6308cb748c2c259de001e44d59ad61ca6dede3120b8eb0eac7f53a2d364a",
+      "state": "COMPLETE",
+      "rounds": 3,
+      "repeats": 9
+    },
+    {
+      "name": "h20-12q",
+      "file": "data/reference/h20_20261104/h20-12q.json.gz",
+      "uncompressed_sha256": "6a5d68e22f1f8db796ee690925964971bbc069bbb34b130d95cba65c51eb50e5",
+      "compressed_sha256": "1995d011f7f6934b448cb1a6cd28f38550bd0a482360f16b5ff1a14e29121eb3",
+      "state": "COMPLETE",
+      "rounds": 3,
+      "repeats": 9
+    }
+  ],
+  "integration_note": "Formal 3x9 measurements were collected with the archived standalone harness. Repository integration validation is recorded separately; its GPU smoke was not run because the supplied resource had no available containers."
+}

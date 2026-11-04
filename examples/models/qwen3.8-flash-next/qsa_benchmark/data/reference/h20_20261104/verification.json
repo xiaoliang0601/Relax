@@ -1,0 +1,53 @@
+{
+  "benchmark_sha256": "a640338fdfc726e444a00168cd8aef6c07677705a695850ff1c978302404f802",
+  "formal_state_counts": {
+    "PASS": 58,
+    "UNSUPPORTED": 6,
+    "SKIPPED_WORKSPACE": 2
+  },
+  "formal_samples_per_metric_per_supported_cell": 27,
+  "max_relative_l2_by_check": {
+    "correctness_out": 0.001913430285640061,
+    "correctness_dq": 0.003455287078395486,
+    "correctness_dk": 0.0037532353308051825,
+    "correctness_dv": 0.0026734701823443174,
+    "recompute_correctness_dq": 0.00024943682365119457,
+    "recompute_correctness_dk": 0.0007865248480811715,
+    "recompute_correctness_dv": 0.00014979575644247234
+  },
+  "largest_round_median_spans": [
+    {
+      "case": "dense-ragged",
+      "heads": 6,
+      "backend": "mixed0",
+      "round_median_span_percent": 1.1384289814544324
+    },
+    {
+      "case": "dense-ragged",
+      "heads": 6,
+      "backend": "v2",
+      "round_median_span_percent": 0.9202762370275683
+    },
+    {
+      "case": "boundaries",
+      "heads": 6,
+      "backend": "nv-flash-per-doc",
+      "round_median_span_percent": 0.8445875054477368
+    },
+    {
+      "case": "boundaries",
+      "heads": 6,
+      "backend": "grouped",
+      "round_median_span_percent": 0.8222554153859575
+    },
+    {
+      "case": "boundaries",
+      "heads": 6,
+      "backend": "nv-indexed",
+      "round_median_span_percent": 0.7677608410782075
+    }
+  ],
+  "synthetic_trace_count": 4,
+  "synthetic_profiles_complete": true,
+  "all_formal_correctness_and_recompute_checks_passed": true
+}

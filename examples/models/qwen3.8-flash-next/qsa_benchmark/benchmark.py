@@ -1,0 +1,904 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+"""Synthetic packed QSA reproducer.
+
+No model, tokenizer, dataset or Megatron is loaded.
+"""
+
+from __future__ import annotations
+import __future__
+
+import argparse
+import ast
+import csv
+import gc
+import hashlib
+import importlib
+import importlib.metadata
+import json
+import math
+import os
+import random
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from typing import Any, Callable
+
+
+ROOT = Path(__file__).resolve().parent
+REPO_ROOT = ROOT.parents[3]
+SCALE = 256**-0.5
+PREFIX = "relax.backends.megatron.megatron_patch"
+BACKENDS = ("v2", "grouped", "mixed0", "nv-bitmap", "nv-indexed", "nv-flash-per-doc")
+
+
+def emit(value: Any) -> None:
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+
+def save(path: Path, value: Any) -> None:
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(value, indent=2) + "\n")
+    temp.replace(path)
+
+
+def random_lengths(rng: random.Random, ranges: list[tuple[int, int]], target: int) -> list[int]:
+    """Draw a ragged bounded composition, independent of all customer
+    inputs."""
+    if not sum(a for a, _ in ranges) <= target <= sum(b for _, b in ranges):
+        raise ValueError("Unreachable synthetic token target")
+    lengths = [rng.randint(a, b) for a, b in ranges]
+    delta = target - sum(lengths)
+    while delta:
+        eligible = (
+            [i for i, (a, b) in enumerate(ranges) if lengths[i] < b]
+            if delta > 0
+            else [i for i, (a, b) in enumerate(ranges) if lengths[i] > a]
+        )
+        rng.shuffle(eligible)
+        for i in eligible:
+            room = ranges[i][1] - lengths[i] if delta > 0 else lengths[i] - ranges[i][0]
+            step = min(abs(delta), room, max(1, abs(delta) // len(eligible)))
+            lengths[i] += step if delta > 0 else -step
+            delta += -step if delta > 0 else step
+            if not delta:
+                break
+    rng.shuffle(lengths)
+    return lengths
+
+
+def cases(seed: int) -> list[dict[str, Any]]:
+    rng = random.Random(seed)
+    result = []
+
+    def add(name: str, lengths: list[int], alignment: int = 1) -> None:
+        valid = sum(lengths)
+        pad = (-valid) % alignment
+        result.append(
+            {
+                "name": name,
+                "real_documents": len(lengths),
+                "valid_tokens": valid,
+                "padding_tokens": pad,
+                "lengths": lengths + ([pad] if pad else []),
+                "total_tokens": valid + pad,
+                "padding_is_independent_segment": bool(pad),
+            }
+        )
+
+    add("boundaries", [3, 4, 7, 127, 129, 512, 513, 2051, 2052, 16384, 16385])
+    add("dense-ragged", [rng.randint(32, 2051) for _ in range(13)])
+    add(
+        "packed-short64",
+        random_lengths(rng, [(1025, 2051)] * 2 + [(2500, 8192)] * 11, rng.randint(63000, 64800)),
+        16384,
+    )
+    add(
+        "packed-mixed64",
+        random_lengths(rng, [(1025, 2051)] * 2 + [(2052, 6500)] * 10 + [(20000, 30000)], rng.randint(63000, 64800)),
+        16384,
+    )
+    add(
+        "packed-short128",
+        random_lengths(rng, [(1025, 2051)] * 4 + [(2500, 8192)] * 22, rng.randint(126000, 129000)),
+        8192,
+    )
+    add(
+        "packed-mixed128",
+        random_lengths(
+            rng, [(1025, 2051)] * 2 + [(4097, 16384)] * 9 + [(16385, 30000)] * 2, rng.randint(126000, 129000)
+        ),
+        8192,
+    )
+    for n in (16384, 32768, 65536, 131072):
+        add(f"single-{n}", [n])
+    return result
+
+
+def validate_cases(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Reject malformed layouts before importing CUDA or constructing masks."""
+    if config.get("schema_version") != 1 or type(config.get("seed")) is not int:
+        raise ValueError("Expected synthetic case schema_version=1 and an integer seed")
+    layouts = config.get("cases")
+    if not isinstance(layouts, list) or not layouts:
+        raise ValueError("Expected a nonempty cases list")
+    names = set()
+    for layout in layouts:
+        name = layout.get("name", "")
+        if (
+            not isinstance(name, str)
+            or not name
+            or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for c in name)
+        ):
+            raise ValueError("Case names must contain lowercase letters, digits, hyphens or underscores")
+        if name in names:
+            raise ValueError("Duplicate case name: " + name)
+        names.add(name)
+        lengths = layout.get("lengths")
+        if not isinstance(lengths, list) or not lengths or any(type(n) is not int or n <= 0 for n in lengths):
+            raise ValueError("Document lengths must be positive integers: " + name)
+        total, padding = sum(lengths), layout.get("padding_tokens")
+        if type(padding) is not int or padding < 0 or total > 131072 or layout.get("total_tokens") != total:
+            raise ValueError("Invalid total or padding: " + name)
+        if layout.get("valid_tokens") != total - padding:
+            raise ValueError("Valid tokens do not match padding: " + name)
+        if layout.get("real_documents") != len(lengths) - bool(padding):
+            raise ValueError("Document count does not match padding: " + name)
+        if bool(padding) != layout.get("padding_is_independent_segment") or (padding and lengths[-1] != padding):
+            raise ValueError("Padding must be the final isolated segment: " + name)
+    return layouts
+
+
+def export_inputs(
+    directory: Path,
+    layout: dict[str, Any],
+    q: Any,
+    k: Any,
+    v: Any,
+    grad: Any,
+    selection: Any,
+    index_q: Any,
+    index_keys: list[Any],
+) -> None:
+    """Write generated tensors locally, outside all timed regions."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{layout['name']}-{layout['heads']}q.pt"
+    payload = {
+        "schema_version": 1,
+        "scope": "Fully generated synthetic QSA inputs",
+        "case": layout,
+        "torch_version": str(torch.__version__),
+        "q": q.detach().cpu(),
+        "k": k.detach().cpu(),
+        "v": v.detach().cpu(),
+        "dO": grad.detach().cpu(),
+        "selected_ids": selection.selected_ids.cpu(),
+        "selected_bits": selection.selected_bits.cpu(),
+        "positions": selection.positions.cpu(),
+        "doc_ids": selection.doc_ids.cpu(),
+        "bits_per_row": selection.bits_per_row,
+        "bounds": list(selection.bounds),
+        "post_rope_index_q": index_q.cpu(),
+        "pooled_keys": [t.cpu() for t in index_keys],
+    }
+    torch.save(payload, path)
+    emit({"case": layout["name"], "heads": layout["heads"], "exported": path.name, "bytes": path.stat().st_size})
+
+
+def verify_sources(repo: Path) -> dict[str, Any]:
+    manifest = json.loads((ROOT / "source-manifest.json").read_text())
+    for entry in manifest["files"]:
+        data = (repo / entry["path"]).read_bytes()
+        blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+        if blob != entry["git_blob"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+            raise RuntimeError("Pinned repository source mismatch: " + entry["path"])
+    return manifest
+
+
+def extracted(path: Path, function: str, name: str) -> ModuleType:
+    """Load one unchanged upstream definition, without its model
+    monkeypatches."""
+    tree = ast.parse(path.read_text(), filename=str(path))
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == function)
+    module = ModuleType(name)
+    module.__file__ = str(path)
+    module.__dict__.update(torch=torch, Tensor=torch.Tensor, triton=triton, tl=triton.language)
+    sys.modules[name] = module
+    exec(
+        compile(
+            ast.Module(body=[node], type_ignores=[]), str(path), "exec", flags=__future__.annotations.compiler_flag
+        ),
+        module.__dict__,
+    )
+    return module
+
+
+def load_relax(repo: Path) -> dict[str, Any]:
+    source = repo
+    names = ("relax", "relax.backends", "relax.backends.megatron", PREFIX, PREFIX + ".qsa_mixed_ops", "relax.utils")
+    for name in names:
+        module = ModuleType(name)
+        module.__path__ = [str(source.joinpath(*name.split(".")))]
+        sys.modules[name] = module
+    env = ModuleType("relax.utils.env")
+    env.Envs = SimpleNamespace(RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN=0)
+    sys.modules[env.__name__] = env
+    patch = source.joinpath(*PREFIX.split("."))
+    extracted(patch / "qsa_block_mask_patch.py", "_classify_blocks", PREFIX + ".qsa_block_mask_patch")
+    route_module = extracted(patch / "qsa_community_patch.py", "_tilelang_routes", PREFIX + ".qsa_community_patch")
+    return {
+        "v2": importlib.import_module(PREFIX + ".qsa_triton_v2"),
+        "grouped": importlib.import_module(PREFIX + ".qsa_mixed_ops.grouped"),
+        "mixed0": importlib.import_module(PREFIX + ".qsa_mixed_ops.mixed"),
+        "selector": importlib.import_module(PREFIX + ".qsa_mixed_ops.selector"),
+        "expand": route_module._tilelang_routes,
+    }
+
+
+def score_topk(
+    mod: Any, query: Any, keys: list[Any], lengths: list[int], mode: str, first: int = 0, last: int | None = None
+) -> Any:
+    last = sum(lengths) if last is None else last
+    output = torch.full((last - first, 512), -1, device=query.device, dtype=torch.int32)
+    start = 0
+    for length, key in zip(lengths, keys):
+        end = start + length
+        if length <= 2051:
+            a, b = max(first, start), min(last, end)
+            if a < b:
+                positions = torch.arange(a - start, b - start, device=query.device, dtype=torch.int32)
+                ids = torch.arange(min(512, key.shape[0]), device=query.device, dtype=torch.int32)
+                output[a - first : b - first, : ids.numel()] = torch.where(
+                    ids[None] < (positions[:, None] + 1) // 4, ids[None], -1
+                )
+            start = end
+            continue
+        for a in range(max(first, start), min(last, end), 512):
+            b = min(a + 512, end, last)
+            if not key.shape[0]:
+                continue
+            positions = torch.arange(a - start, b - start, device=query.device, dtype=torch.int32)
+            if mode == "compile":
+                ids = mod.compiled_score_topk(query[a:b], key, positions, 512)
+            else:
+                logits = mod.index_scores(query[a:b], key).relu().sum(-1) / math.sqrt(128)
+                visible = torch.arange(key.shape[0], device=query.device)[None] < (positions[:, None] + 1) // 4
+                values, ids = logits.masked_fill(~visible, -torch.inf).topk(min(512, key.shape[0]), dim=-1)
+                ids = ids.masked_fill(~torch.isfinite(values), -1).to(torch.int32)
+            output[a - first : b - first, : ids.shape[1]] = ids
+        start = end
+    return output
+
+
+def make_selection(
+    mod: Any, layout: dict[str, Any], seed: int, mode: str
+) -> tuple[Any, dict[str, Any], Any, list[Any]]:
+    lengths, total = layout["lengths"], layout["total_tokens"]
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    query = torch.randn((total, 4, 128), generator=generator, device="cuda", dtype=torch.bfloat16)
+    keys = [torch.randn((n // 4, 128), generator=generator, device="cuda", dtype=torch.bfloat16) for n in lengths]
+    with torch.no_grad():
+        ids = score_topk(mod, query, keys, lengths, mode)
+    groups = ids.cpu().numpy()
+    positions = np.concatenate([np.arange(n, dtype=np.int32) for n in lengths])
+    documents = np.repeat(np.arange(len(lengths), dtype=np.int32), lengths)
+    complete = (positions + 1) // 4
+    # Validate causal, unique complete groups and full coverage below the budget.
+    ordered = np.sort(groups, axis=1)
+    assert np.all((groups < 0) | (groups < complete[:, None]))
+    assert np.all((groups >= 0).sum(-1) == np.minimum(complete, 512))
+    assert np.all((ordered[:, 1:] < 0) | (ordered[:, 1:] != ordered[:, :-1]))
+    width = math.ceil(math.ceil(max(lengths) / 4) / 8)
+    bits = np.zeros((total, width), dtype=np.uint8)
+    for start in range(0, total, 1024):
+        part = groups[start : start + 1024]
+        row, col = np.nonzero(part >= 0)
+        group = part[row, col]
+        np.bitwise_or.at(bits, (row + start, group // 8), (1 << (group % 8)).astype(np.uint8))
+    bounds = [0]
+    for length in lengths:
+        bounds.append(bounds[-1] + length)
+    selection = SimpleNamespace(
+        positions=torch.from_numpy(positions).cuda()[None],
+        doc_ids=torch.from_numpy(documents).cuda()[None],
+        selected_ids=ids[None],
+        selected_bits=torch.from_numpy(bits).cuda().flatten(),
+        bits_per_row=width,
+        compress_ratio=4,
+        bounds=tuple(bounds),
+    )
+    return selection, {"positions": positions, "documents": documents, "bits": bits, "bounds": bounds}, query, keys
+
+
+def bitmap_metadata(ids: Any, lengths: tuple[int, ...]) -> tuple[Any, ...]:
+    """Benchmark adapter: independent R4 numbering for each ragged document."""
+    total = sum(lengths)
+    counts = [(n + 3) // 4 for n in lengths]
+    bounds, offsets = [0], [0]
+    for length, count in zip(lengths, counts):
+        bounds.append(bounds[-1] + length)
+        offsets.append(offsets[-1] + count)
+    repeats = torch.tensor(lengths, device=ids.device, dtype=torch.int64)
+    bases = torch.repeat_interleave(
+        torch.tensor(bounds[:-1], device=ids.device, dtype=torch.int64), repeats, output_size=total
+    )
+    block_bases = torch.repeat_interleave(
+        torch.tensor(offsets[:-1], device=ids.device, dtype=torch.int64), repeats, output_size=total
+    )
+    physical = torch.arange(total, device=ids.device, dtype=torch.int64)
+    positions = physical - bases
+    valid = (ids >= 0) & (ids < (positions[:, None] + 1) // 4)
+    bitmap = torch.zeros((total, offsets[-1]), device=ids.device, dtype=torch.uint8)
+    columns = (ids.long() + block_bases[:, None]).clamp(0, offsets[-1] - 1)
+    bitmap.scatter_reduce_(1, columns, valid.byte(), reduce="amax", include_self=True)
+    bitmap.scatter_reduce_(
+        1,
+        (block_bases + positions // 4)[:, None],
+        ((positions + 1) % 4 != 0).byte()[:, None],
+        reduce="amax",
+        include_self=True,
+    )
+    first = torch.cat(
+        [torch.arange(n, device=ids.device, dtype=torch.int64) * 4 + start for start, n in zip(bounds[:-1], counts)]
+    )
+    last = torch.cat([(part + 3).clamp_max(end - 1) for part, end in zip(first.split(counts), bounds[1:])])
+    return bitmap, bases.int(), physical.int(), block_bases.int(), bases.int(), first.int(), last.int()
+
+
+def flash(q: Any, k: Any, v: Any, lengths: tuple[int, ...]) -> Any:
+    from flash_attn import flash_attn_varlen_func
+
+    bounds = [0]
+    for n in lengths:
+        bounds.append(bounds[-1] + n)
+    cu = torch.tensor(bounds, device=q.device, dtype=torch.int32)
+    return flash_attn_varlen_func(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        cu,
+        cu,
+        max(lengths),
+        max(lengths),
+        softmax_scale=SCALE,
+        causal=True,
+    )
+
+
+def reference(q: Any, k: Any, v: Any, upstream: Any, cpu: dict[str, Any]) -> tuple[Any, ...]:
+    """FP32 oracle on boundary/regular query rows; full dK/dV for sparse dO."""
+    total = q.shape[0]
+    rows = set(np.linspace(0, total - 1, min(48, total), dtype=np.int64).tolist())
+    for start, end in zip(cpu["bounds"][:-1], cpu["bounds"][1:]):
+        rows.update(
+            start + p for p in (0, 1, 2, 3, 126, 127, 128, 2050, 2051, 2052, end - start - 1) if 0 <= p < end - start
+        )
+    rows_cpu = np.asarray(sorted(rows), dtype=np.int64)
+    rows_gpu = torch.from_numpy(rows_cpu).cuda()
+    output_parts, dq_parts = [], []
+    dk, dv = torch.zeros_like(k, dtype=torch.float32), torch.zeros_like(v, dtype=torch.float32)
+    for group in np.array_split(rows_cpu, max(1, math.ceil(len(rows_cpu) / 16))):
+        row = torch.from_numpy(group).cuda()
+        qp, kp = cpu["positions"][group, None], cpu["positions"][None, :]
+        selected = ((cpu["bits"][group[:, None], kp // 32] >> (kp // 4 % 8)) & 1).astype(bool)
+        mask = (cpu["documents"][group, None] == cpu["documents"][None, :]) & (kp <= qp)
+        mask &= selected | (kp >= ((qp + 1) // 4) * 4)
+        qq, kk, vv = (
+            q.detach()[row].float().requires_grad_(),
+            k.detach().float().requires_grad_(),
+            v.detach().float().requires_grad_(),
+        )
+        scores = torch.einsum("rhd,shd->hrs", qq, kk.expand(-1, q.shape[1], -1)) * SCALE
+        probs = scores.masked_fill(~torch.from_numpy(mask).cuda()[None], -torch.inf).softmax(-1)
+        output = torch.einsum("hrs,shd->rhd", probs, vv.expand(-1, q.shape[1], -1))
+        gradients = torch.autograd.grad(output, (qq, kk, vv), upstream[row].float())
+        output_parts.append(output.detach())
+        dq_parts.append(gradients[0].detach())
+        dk += gradients[1].detach()
+        dv += gradients[2].detach()
+    dq = torch.zeros_like(q, dtype=torch.float32)
+    dq[rows_gpu] = torch.cat(dq_parts)
+    sparse = torch.zeros_like(upstream)
+    sparse[rows_gpu] = upstream[rows_gpu]
+    return rows_gpu, torch.cat(output_parts), dq, dk, dv, sparse
+
+
+def errors(actual: Any, expected: Any) -> dict[str, Any]:
+    a, b = actual.detach().float(), expected.detach().float()
+    finite = bool(torch.isfinite(a).all())
+    relative = float(torch.linalg.vector_norm(a - b) / torch.linalg.vector_norm(b).clamp_min(1e-30))
+    absolute = float((a - b).abs().max())
+    close = bool(((a - b).abs() <= 0.04 + 0.04 * b.abs()).all())
+    return {
+        "finite": finite,
+        "relative_l2": relative,
+        "max_abs": absolute,
+        "passed": finite and close and relative <= 0.02,
+    }
+
+
+def timed(call: Callable[[], Any], args: Any, setup: Callable[[], None] | None = None) -> dict[str, Any]:
+    def run() -> None:
+        if setup:
+            setup()
+        value = call()
+        del value
+
+    for _ in range(args.warmup):
+        run()
+    torch.cuda.synchronize()
+    until = time.monotonic() + 0.2
+    while time.monotonic() < until:
+        run()
+        torch.cuda.synchronize()
+    samples = []
+    begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    for _ in range(args.repeats):
+        if setup:
+            setup()
+            torch.cuda.synchronize()
+        wall = time.perf_counter()
+        begin.record()
+        value = call()
+        end.record()
+        end.synchronize()
+        samples.append({"cuda_ms": begin.elapsed_time(end), "wall_ms": (time.perf_counter() - wall) * 1000})
+        del value
+    return {
+        "median_cuda_ms": statistics.median(x["cuda_ms"] for x in samples),
+        "median_wall_ms": statistics.median(x["wall_ms"] for x in samples),
+        "samples": samples,
+    }
+
+
+def fingerprint(tensor: Any) -> str:
+    return hashlib.sha256(tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+
+
+def check_idle() -> None:
+    """Read-only check; never suspend, signal or terminate another GPU
+    process."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+    physical = visible if visible else "0"
+    output = subprocess.check_output(
+        ["nvidia-smi", "--id=" + physical, "--query-compute-apps=pid", "--format=csv,noheader"], text=True
+    ).strip()
+    if output:
+        raise RuntimeError("Selected GPU is busy; no processes were changed")
+
+
+def write_csv(report: dict[str, Any], output: Path) -> None:
+    rows = []
+    for case in report["cases"]:
+        for name, result in case["backends"].items():
+            for metric in ("prepare", "forward_total", "forward_prepared", "backward", "forward_backward_total"):
+                samples = [s["cuda_ms"] for r in result.get("rounds", []) for s in r[metric]["samples"]]
+                if samples:
+                    rows.append(
+                        {
+                            "case": case["name"],
+                            "heads": case["heads"],
+                            "tokens": case["total_tokens"],
+                            "documents": len(case["lengths"]),
+                            "backend": name,
+                            "metric": metric,
+                            "state": result["state"],
+                            "median_cuda_ms": statistics.median(samples),
+                            "samples": len(samples),
+                        }
+                    )
+    with (output / "timings.csv").open("w") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]) if rows else ["case", "state"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, default=REPO_ROOT)
+    parser.add_argument("--output", type=Path, default=Path("results"))
+    parser.add_argument("--cases-file", type=Path, default=ROOT / "data/synthetic_cases.json")
+    parser.add_argument("--export-inputs", type=Path, help="Write generated tensor inputs locally; do not commit them")
+    parser.add_argument(
+        "--export-only", action="store_true", help="Generate inputs without correctness checks or timing"
+    )
+    parser.add_argument("--heads", default="6,12")
+    parser.add_argument(
+        "--cases", default="boundaries,dense-ragged,packed-short64,packed-mixed64,single-32768,single-65536"
+    )
+    parser.add_argument("--backends", default=",".join(BACKENDS))
+    parser.add_argument(
+        "--seed", type=int, help="Override tensor/selector seed; document lengths come from --cases-file"
+    )
+    parser.add_argument("--selector-mode", choices=("eager", "compile"), default="compile")
+    parser.add_argument(
+        "--selector-timing", action="store_true", help="Time score/top-k on one synthetic TP query shard"
+    )
+    parser.add_argument("--qsa-source", type=Path, help="Optional pinned cudnn-frontend checkout/python/cudnn/QSA")
+    parser.add_argument(
+        "--profile", action="store_true", help="Export one warm synthetic forward/backward Chrome trace per cell"
+    )
+    parser.add_argument(
+        "--skip-recompute-check", action="store_true", help="Disable the extra checkpoint/recompute gradient check"
+    )
+    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=9)
+    parser.add_argument("--max-bitmap-gib", type=float, default=2.0)
+    parser.add_argument("--grouped-backward-block-k", type=int, choices=(32, 64, 128), default=32)
+    parser.add_argument("--grouped-backward-warps", type=int, choices=(4, 8, 16), default=4)
+    parser.add_argument("--grouped-backward-stages", type=int, default=3)
+    parser.add_argument(
+        "--describe", action="store_true", help="Print synthetic layouts and verify sources without CUDA"
+    )
+    args = parser.parse_args()
+    if min(args.rounds, args.warmup, args.repeats) < 1:
+        parser.error("rounds, warmup and repeats must be positive")
+    manifest = verify_sources(args.repo.resolve())
+    config = json.loads(args.cases_file.read_text())
+    configured = validate_cases(config)
+    if args.seed is None:
+        args.seed = config["seed"]
+    layouts = [c for c in configured if c["name"] in args.cases.split(",")]
+    if args.export_only and args.export_inputs is None:
+        parser.error("--export-only requires --export-inputs")
+    if set(args.cases.split(",")) != {c["name"] for c in layouts}:
+        parser.error("Unknown case; inspect cases() for the supported names")
+    names = args.backends.split(",")
+    if set(names) - set(BACKENDS):
+        parser.error("Unknown backend")
+    heads_values = list(map(int, args.heads.split(",")))
+    if any(h not in (6, 12) for h in heads_values):
+        parser.error("Use 6 heads for TP4 or 12 heads for TP2")
+    if args.describe:
+        emit({"source_commit": manifest["commit"], "seed": args.seed, "layout_seed": config["seed"], "cases": layouts})
+        return
+    check_idle()
+    os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = "0"
+    launch_options = {
+        "RELAX_QWEN38_QSA_GROUPED_BACKWARD_BLOCK_K": str(args.grouped_backward_block_k),
+        "RELAX_QWEN38_QSA_GROUPED_BACKWARD_WARPS": str(args.grouped_backward_warps),
+        "RELAX_QWEN38_QSA_GROUPED_BACKWARD_STAGES": str(args.grouped_backward_stages),
+        "RELAX_QWEN38_QSA_FLEX_SPARSE_MASK": "1",
+    }
+    os.environ.update(launch_options)
+    global torch, np, triton
+    import numpy as np
+    import torch
+    import triton
+    import triton.language
+
+    torch.set_num_threads(4)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    torch.backends.cudnn.allow_tf32 = False
+    modules = load_relax(args.repo.resolve())
+    nv = indexed = None
+    nv_manifest = json.loads((ROOT / "nv-source-manifest.json").read_text())
+    if not args.export_only and any(name.startswith("nv-") for name in names):
+        if args.qsa_source:
+            import cudnn
+
+            if args.qsa_source.name != "QSA" or not (args.qsa_source / "api.py").is_file():
+                parser.error("--qsa-source must point to checkout/python/cudnn/QSA")
+            cudnn.__path__.insert(0, str(args.qsa_source.resolve().parent))
+        from cudnn.QSA import api as nv
+        from cudnn.QSA.indexed import api as indexed
+
+        for entry in nv_manifest["files"]:
+            path, expected = entry["path"], entry["git_blob"]
+            data = (Path(nv.__file__).parent / path).read_bytes()
+            blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+            if blob != expected:
+                raise RuntimeError("NV PR source mismatch: " + path)
+
+    class Bitmap(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx: Any, q: Any, k: Any, v: Any, metadata: Any) -> Any:
+            out, fp32, lse = nv.qsa_forward(q, k, v, *metadata, SCALE, 4)
+            ctx.save_for_backward(q, k, v, fp32, lse, *metadata)
+            return out
+
+        @staticmethod
+        def backward(ctx: Any, grad: Any) -> tuple[Any, ...]:
+            q, k, v, fp32, lse, *metadata = ctx.saved_tensors
+            return (*nv.qsa_backward(grad.contiguous(), q, k, v, fp32, lse, *metadata, SCALE, 4), None)
+
+    class Indexed(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx: Any, q: Any, k: Any, v: Any, indices: Any) -> Any:
+            result = indexed.qsa_indexed_forward(q, k, v, indices, scale=SCALE)
+            ctx.save_for_backward(q, k, v, result["out_fp32"], result["lse"], indices)
+            return result["out"]
+
+        @staticmethod
+        def backward(ctx: Any, grad: Any) -> tuple[Any, ...]:
+            q, k, v, fp32, lse, indices = ctx.saved_tensors
+            result = indexed.qsa_indexed_backward(
+                grad.contiguous(), q, k, v, fp32, lse, indices, scale=SCALE, selection_mode="general"
+            )
+            return result["dq"], result["dk"], result["dv"], None
+
+    args.output.mkdir(parents=True, exist_ok=True)
+    properties = torch.cuda.get_device_properties(0)
+    versions = {}
+    for name in ("torch", "triton", "numpy", "nvidia-cudnn-frontend", "nvidia-cutlass-dsl", "flash-attn"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = "not installed under this distribution name"
+    report = {
+        "state": "RUNNING",
+        "scope": "Random synthetic QKV, post-RoPE indexer features and ragged layouts only",
+        "benchmark_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "source_commit": manifest["commit"],
+        "nv_source_commit": nv_manifest["commit"],
+        "seed": args.seed,
+        "device": properties.name,
+        "capability": list(torch.cuda.get_device_capability()),
+        "layout_seed": config["seed"],
+        "cases_file_sha256": hashlib.sha256(args.cases_file.read_bytes()).hexdigest(),
+        "memory_gib": properties.total_memory / 1024**3,
+        "versions": versions,
+        "rounds": args.rounds,
+        "repeats": args.repeats,
+        "warmup": args.warmup,
+        "selector_mode": args.selector_mode,
+        "cuda_runtime": torch.version.cuda,
+        "torch_cudnn_version": torch.backends.cudnn.version(),
+        "tf32_cublas_override": os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"],
+        "grouped_launch_options": launch_options,
+        "attention_timing_scope": "Public autograd wrappers; fresh plans/routes/bitmaps included in total metrics; score/top-k excluded",
+        "backward_timing_scope": "Fresh forward and plan prepared outside each timed backward; retain_graph=False",
+        "correctness_scope": "Independent FP32 boundary/regular query rows; full dQ/dK/dV for sparse output gradient; timed gradients are dense random",
+        "cases": [],
+    }
+    save(args.output / "results.json", report)
+    for layout in layouts:
+        case_seed = args.seed + int(hashlib.sha256(layout["name"].encode()).hexdigest()[:8], 16)
+        emit({"case": layout["name"], "phase": "synthetic selection"})
+        sel, cpu, index_q, index_keys = make_selection(modules["selector"], layout, case_seed, args.selector_mode)
+        for heads in heads_values:
+            torch.manual_seed(case_seed + heads * 1000)
+            total = layout["total_tokens"]
+            q = torch.randn((total, heads, 256), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            k = torch.randn((total, 1, 256), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            v = torch.randn_like(k, requires_grad=True)
+            grad = torch.randn_like(q)
+            if layout["padding_tokens"]:
+                grad[layout["valid_tokens"] :] = 0
+            case = {
+                **layout,
+                "heads": heads,
+                "kv_heads": 1,
+                "backends": {},
+                "memory": {
+                    "whole_bitmap_body_bytes": total * sum((n + 3) // 4 for n in layout["lengths"]),
+                    "per_doc_bitmap_body_bytes": sum(n * ((n + 3) // 4) for n in layout["lengths"] if n > 2051),
+                    "expanded_indices_bytes": total * 2052 * 4,
+                    "selection_bitset_bytes": total * sel.bits_per_row,
+                },
+                "strides": {name: list(t.stride()) for name, t in (("q", q), ("k", k), ("v", v))},
+                "fingerprints": {
+                    name: fingerprint(t)
+                    for name, t in (("q", q), ("k", k), ("v", v), ("dO", grad), ("selected_ids", sel.selected_ids))
+                },
+            }
+            report["cases"].append(case)
+            if args.export_inputs is not None:
+                export_inputs(args.export_inputs, case, q, k, v, grad, sel, index_q, index_keys)
+            if args.export_only:
+                save(args.output / "results.json", report)
+                q = k = v = grad = None
+                gc.collect()
+                continue
+            oracle = reference(q, k, v, grad, cpu)
+
+            def routes() -> Any:
+                indices = torch.nn.functional.pad(modules["expand"](sel, 1, total)[0], (0, 1), value=-1)
+                indices._qsa_bounds = sel.bounds
+                return indices
+
+            def factory(name: str) -> tuple[Callable[[], Any], Callable[[Any], Any]]:
+                lengths = tuple(layout["lengths"])
+                if name == "v2":
+                    return lambda: modules["v2"].build_plan(sel, total), lambda p: modules["v2"].qsa_fused_attention(
+                        q, k, v, sel, p, None, SCALE
+                    )
+                if name == "grouped":
+                    return routes, lambda p: modules["grouped"].attention_bf16(q, k, v, p, SCALE)
+                if name == "mixed0":
+                    if heads != 12 and max(lengths) > 2051:
+                        raise NotImplementedError("Pinned mixed0 long_attention requires 12Q/1KV; assertion preserved")
+                    return routes, lambda p: modules["mixed0"].attention(q, k, v, p, SCALE)
+                if name == "nv-indexed":
+                    return routes, lambda p: Indexed.apply(q, k, v, p)
+                bitmap_bytes = (
+                    total * sum((n + 3) // 4 for n in lengths)
+                    if name == "nv-bitmap"
+                    else sum(n * ((n + 3) // 4) for n in lengths if n > 2051)
+                )
+                if bitmap_bytes > args.max_bitmap_gib * 1024**3:
+                    raise MemoryError(
+                        "Synthetic bitmap body exceeds benchmark guard; increase --max-bitmap-gib explicitly"
+                    )
+                if name == "nv-bitmap":
+                    return lambda: bitmap_metadata(sel.selected_ids[0], lengths), lambda p: Bitmap.apply(q, k, v, p)
+                if name == "nv-flash-per-doc":
+                    short = tuple(i for i, n in enumerate(lengths) if n <= 2051)
+
+                    def prepare() -> tuple[Any, ...]:
+                        return tuple(
+                            None if i in short else bitmap_metadata(sel.selected_ids[0, a:b], (b - a,))
+                            for i, (a, b) in enumerate(zip(sel.bounds[:-1], sel.bounds[1:]))
+                        )
+
+                    def forward(metadata: tuple[Any, ...]) -> Any:
+                        chunks = tuple(t.split(lengths, dim=0) for t in (q, k, v))
+                        outputs = [None] * len(lengths)
+                        if short:
+                            dense = flash(
+                                *(torch.cat([parts[i] for i in short]) for parts in chunks),
+                                tuple(lengths[i] for i in short),
+                            )
+                            for i, part in zip(short, dense.split(tuple(lengths[i] for i in short), dim=0)):
+                                outputs[i] = part
+                        for i, meta in enumerate(metadata):
+                            if meta is not None:
+                                outputs[i] = Bitmap.apply(*(parts[i] for parts in chunks), meta)
+                        return torch.cat(outputs)
+
+                    return prepare, forward
+                raise ValueError(name)
+
+            if args.selector_timing:
+                shard = total // (4 if heads == 6 else 2)
+                with torch.no_grad():
+                    case["selector_score_topk_one_TP_query_shard"] = timed(
+                        lambda: score_topk(
+                            modules["selector"], index_q, index_keys, layout["lengths"], args.selector_mode, 0, shard
+                        ),
+                        args,
+                    )
+                case["selector_shard_rows"] = shard
+            for round_index in range(args.rounds):
+                for name in names if round_index % 2 == 0 else list(reversed(names)):
+                    record = case["backends"].setdefault(name, {"rounds": []})
+                    if record.get("state") in ("UNSUPPORTED", "SKIPPED_WORKSPACE", "ERROR", "NUMERIC_FAIL"):
+                        continue
+                    emit(
+                        {
+                            "case": layout["name"],
+                            "heads": heads,
+                            "backend": name,
+                            "round": round_index,
+                            "phase": "start",
+                        }
+                    )
+                    try:
+                        out = gradients = fixed = frozen = direct = replayed = None
+                        values = []
+                        prepare, forward = factory(name)
+                        if round_index == 0:
+                            out = forward(prepare())
+                            gradients = torch.autograd.grad(out, (q, k, v), oracle[-1])
+                            record["correctness"] = {
+                                key: errors(a, b)
+                                for key, a, b in zip(
+                                    ("out", "dq", "dk", "dv"), (out[oracle[0]], *gradients), oracle[1:5]
+                                )
+                            }
+                            del out, gradients
+                            if not all(e["passed"] for e in record["correctness"].values()):
+                                record["state"] = "NUMERIC_FAIL"
+                                save(args.output / "results.json", report)
+                                continue
+                            if not args.skip_recompute_check:
+                                from torch.utils.checkpoint import checkpoint
+
+                                frozen = prepare()
+                                direct = torch.autograd.grad(forward(frozen), (q, k, v), grad)
+                                replayed = torch.autograd.grad(
+                                    checkpoint(lambda: forward(frozen), use_reentrant=False), (q, k, v), grad
+                                )
+                                record["recompute_correctness"] = {
+                                    key: errors(a, b) for key, a, b in zip(("dq", "dk", "dv"), replayed, direct)
+                                }
+                                del frozen, direct, replayed
+                                if not all(e["passed"] for e in record["recompute_correctness"].values()):
+                                    record["state"] = "NUMERIC_FAIL"
+                                    save(args.output / "results.json", report)
+                                    continue
+
+                        def fwd() -> Any:
+                            return forward(prepare())
+
+                        def fb() -> Any:
+                            return torch.autograd.grad(fwd(), (q, k, v), grad)
+
+                        def before_backward() -> None:
+                            values.append(fwd())
+
+                        def backward() -> Any:
+                            return torch.autograd.grad(values.pop(), (q, k, v), grad)
+
+                        fixed = prepare()
+                        measurements = {
+                            "prepare": timed(prepare, args),
+                            "forward_total": timed(fwd, args),
+                            "forward_prepared": timed(lambda: forward(fixed), args),
+                            "backward": timed(backward, args, before_backward),
+                            "forward_backward_total": timed(fb, args),
+                        }
+                        del fixed
+                        allocated = torch.cuda.memory_allocated()
+                        torch.cuda.reset_peak_memory_stats()
+                        value = fb()
+                        torch.cuda.synchronize()
+                        measurements["fresh_cycle_peak_increment_bytes"] = (
+                            torch.cuda.max_memory_allocated() - allocated
+                        )
+                        del value
+                        record["rounds"].append(measurements)
+                        record["state"] = "PASS"
+                        if args.profile and round_index == 0:
+                            for _ in range(3):
+                                value = fb()
+                                del value
+                            torch.cuda.synchronize()
+                            filename = f"{layout['name']}-{heads}q-{name}.trace.json"
+                            with torch.profiler.profile(
+                                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                                record_shapes=True,
+                                with_stack=False,
+                            ) as profile:
+                                value = fb()
+                                torch.cuda.synchronize()
+                            del value
+                            profile.export_chrome_trace(str(args.output / filename))
+                            record["synthetic_trace"] = filename
+                        emit(
+                            {
+                                "case": layout["name"],
+                                "heads": heads,
+                                "backend": name,
+                                "round": round_index,
+                                "fb_ms": measurements["forward_backward_total"]["median_cuda_ms"],
+                                "state": "PASS",
+                            }
+                        )
+                    except NotImplementedError as error:
+                        record.update(state="UNSUPPORTED", error=str(error))
+                    except MemoryError as error:
+                        record.update(state="SKIPPED_WORKSPACE", error=str(error))
+                    except Exception as error:
+                        record.update(
+                            state="ERROR",
+                            error=type(error).__name__ + ": " + str(error).replace(str(ROOT), "<benchmark>"),
+                        )
+                        if any(s in str(error).lower() for s in ("illegal memory access", "device-side assert")):
+                            report["state"] = "FAILED_CUDA_CONTEXT"
+                            save(args.output / "results.json", report)
+                            raise
+                    out = gradients = fixed = frozen = direct = replayed = None
+                    values.clear()
+                    save(args.output / "results.json", report)
+            oracle = q = k = v = grad = None
+            gc.collect()
+        sel = cpu = index_q = index_keys = None
+        gc.collect()
+    failures = sum(
+        r.get("state") in ("ERROR", "NUMERIC_FAIL") for c in report["cases"] for r in c["backends"].values()
+    )
+    report["state"] = "GENERATED" if args.export_only else ("COMPLETE_WITH_FAILURES" if failures else "COMPLETE")
+    report["failures"] = failures
+    save(args.output / "results.json", report)
+    write_csv(report, args.output)
+    emit({"state": report["state"], "cases": len(report["cases"]), "failures": failures})
+
+
+if __name__ == "__main__":
+    main()

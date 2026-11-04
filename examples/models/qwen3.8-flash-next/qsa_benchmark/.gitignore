@@ -1,0 +1,7 @@
+__pycache__/
+/results/
+/generated/
+/generated_inputs/
+*.pt
+!data/reference/h20_20261104/traces/
+!data/reference/h20_20261104/traces/**

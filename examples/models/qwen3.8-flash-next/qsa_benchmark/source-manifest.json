@@ -1,0 +1,90 @@
+{
+  "repository": "https://github.com/xiaoliang0601/Relax",
+  "commit": "d16f2e3ec45be059db6377295090b1d49257892c",
+  "files": [
+    {
+      "path": "relax/backends/megatron/megatron_patch/qsa_mixed_ops/__init__.py",
+      "upstream_path": "relax/backends/megatron/megatron_patch/qsa_mixed_ops/__init__.py",
+      "git_blob": "576345497076bf1bcbded48aec2179fb1e16ddbc",
+      "url": "https://github.com/xiaoliang0601/Relax/blob/d16f2e3ec45be059db6377295090b1d49257892c/relax/backends/megatron/megatron_patch/qsa_mixed_ops/__init__.py",
+      "sha256": "d4afb890a1017ecb359488c711d80279dbea2ee1a7faa12383a637efe84da8f1"
+    },
+    {
+      "path": "relax/backends/megatron/megatron_patch/qsa_mixed_ops/block_mask.py",
+      "upstream_path": "relax/backends/megatron/megatron_patch/qsa_mixed_ops/block_mask.py",
+      "git_blob": "ac3e794d0a5e2096fd0ff0736ad8cfe063cb2ad1",
+      "url": "https://github.com/xiaoliang0601/Relax/blob/d16f2e3ec45be059db6377295090b1d49257892c/relax/backends/megatron/megatron_patch/qsa_mixed_ops/block_mask.py",
+      "sha256": "c80d82bf62f255796098717948b68604301f0feef125bd2791f6670c7d94db08"
+    },
+    {
+      "path": "relax/backends/megatron/megatron_patch/qsa_mixed_ops/flex.py",
+      "upstream_path": "relax/backends/megatron/megatron_patch/qsa_mixed_ops/flex.py",
+      "git_blob": "1482e4cdc2c2736e1fc38747c10717aef9a2e5e8",
+      "url": "https://github.com/xiaoliang0601/Relax/blob/d16f2e3ec45be059db6377295090b1d49257892c/relax/backends/megatron/megatron_patch/qsa_mixed_ops/flex.py",
+      "sha256": "007a1977e1215568000b6650d27f3b1e9de60fafd37a8dec65ddf6530d5b9302"
+    },
+    {
+      "path": "relax/backends/megatron/megatron_patch/qsa_mixed_ops/grouped.py",
+      "upstream_path": "relax/backends/megatron/megatron_patch/qsa_mixed_ops/grouped.py",
+      "git_blob": "a850145678f3c0ee3c48706083eb63db86471cd7",
+      "url": "https://github.com/xiaoliang0601/Relax/blob/d16f2e3ec45be059db6377295090b1d49257892c/relax/backends/megatron/megatron_patch/qsa_mixed_ops/grouped.py",
+      "sha256": "2168d82a28514243fe015d0e6e45ad6487c06c9350936814f2937dee9d583f36"
+    },
+    {
+      "path": "relax/backends/megatron/megatron_patch/qsa_mixed_ops/mixed.py",
+      "upstream_path": "relax/backends/megatron/megatron_patch/qsa_mixed_ops/mixed.py",
+      "git_blob": "d0a233ec5e2a8687e331f830debaa95f679362cc",
+      "url": "https://github.com/xiaoliang0601/Relax/blob/d16f2e3ec45be059db6377295090b1d49257892c/relax/backends/megatron/megatron_patch/qsa_mixed_ops/mixed.py",
+      "sha256": "ce7a3203c9eba69426b181b2d82450800bc1e04f2320f926ff050e6aaf78ffe2"
+    },
+    {
+      "path": "relax/backends/megatron/megatron_patch/qsa_mixed_ops/selector.py",
+      "upstream_path": "relax/backends/megatron/megatron_patch/qsa_mixed_ops/selector.py",
+      "git_blob": "2f3dc900f081f9e1035e3879d4f39610ac8f5bff",
+      "url": "https://github.com/xiaoliang0601/Relax/blob/d16f2e3ec45be059db6377295090b1d49257892c/relax/backends/megatron/megatron_patch/qsa_mixed_ops/selector.py",
+      "sha256": "7e9fd179d2aa48b9a54da04e11dde730c9afdd0d8c1107fc0ddae9a88d572176"
+    },
+    {
+      "path": "relax/backends/megatron/megatron_patch/qsa_triton_v2/__init__.py",
+      "upstream_path": "relax/backends/megatron/megatron_patch/qsa_triton_v2/__init__.py",
+      "git_blob": "332b7bf3c06da182228f7e5c7f3170dc7cf50640",
+      "url": "https://github.com/xiaoliang0601/Relax/blob/d16f2e3ec45be059db6377295090b1d49257892c/relax/backends/megatron/megatron_patch/qsa_triton_v2/__init__.py",
+      "sha256": "1c07c2e3d39dee2c729b0f9ef8778703e2b1b1a8516f4a6be165439235bb2488"
+    },
+    {
+      "path": "relax/backends/megatron/megatron_patch/qsa_triton_v2/kernels.py",
+      "upstream_path": "relax/backends/megatron/megatron_patch/qsa_triton_v2/kernels.py",
+      "git_blob": "e97e69e0b2dbf6ecccd6bae5d7757e17c4a0704e",
+      "url": "https://github.com/xiaoliang0601/Relax/blob/d16f2e3ec45be059db6377295090b1d49257892c/relax/backends/megatron/megatron_patch/qsa_triton_v2/kernels.py",
+      "sha256": "53b6370db85bcfd09aa5ec63263a3c4f00778653ec425fce16fad440e8c77592"
+    },
+    {
+      "path": "relax/backends/megatron/megatron_patch/qsa_fused_attention.py",
+      "upstream_path": "relax/backends/megatron/megatron_patch/qsa_fused_attention.py",
+      "git_blob": "b5af4b3e576827933de12c9d5e45d0a187ff1736",
+      "url": "https://github.com/xiaoliang0601/Relax/blob/d16f2e3ec45be059db6377295090b1d49257892c/relax/backends/megatron/megatron_patch/qsa_fused_attention.py",
+      "sha256": "df326c0bfe9fda802e3a9ea1c6d45f4c69f882022b8cff746701f2d3e74361a6"
+    },
+    {
+      "path": "relax/backends/megatron/megatron_patch/qsa_block_mask_patch.py",
+      "upstream_path": "relax/backends/megatron/megatron_patch/qsa_block_mask_patch.py",
+      "git_blob": "c557c4de01e71809ce39b1ad424131d24f54416a",
+      "url": "https://github.com/xiaoliang0601/Relax/blob/d16f2e3ec45be059db6377295090b1d49257892c/relax/backends/megatron/megatron_patch/qsa_block_mask_patch.py",
+      "sha256": "228dd3d6bfb7037966f639449139dbdfb0ecbcce4aa165c14845f9d8eef3478f"
+    },
+    {
+      "path": "relax/backends/megatron/megatron_patch/qsa_community_patch.py",
+      "upstream_path": "relax/backends/megatron/megatron_patch/qsa_community_patch.py",
+      "git_blob": "e6c687d52e9dad35b23dfcf5953461c02a876838",
+      "url": "https://github.com/xiaoliang0601/Relax/blob/d16f2e3ec45be059db6377295090b1d49257892c/relax/backends/megatron/megatron_patch/qsa_community_patch.py",
+      "sha256": "52d42c03240e5d8f0f4ac3510224bc12b31bf1c0e8102069156e4aabb3c5a3f9"
+    },
+    {
+      "path": "LICENSE",
+      "upstream_path": "LICENSE",
+      "git_blob": "261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64",
+      "url": "https://github.com/xiaoliang0601/Relax/blob/d16f2e3ec45be059db6377295090b1d49257892c/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    }
+  ]
+}

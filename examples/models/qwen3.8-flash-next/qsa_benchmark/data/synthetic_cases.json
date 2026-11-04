@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "seed": 20261104,
+  "scope": "Fully synthetic; no customer examples or customer document lengths",
+  "attention": {
+    "query_heads": [6, 12],
+    "kv_heads": 1,
+    "head_dim": 256,
+    "dtype": "bfloat16",
+    "dropout": 0
+  },
+  "selection": {
+    "query_heads": 4,
+    "head_dim": 128,
+    "block_tokens": 4,
+    "topk_blocks": 512,
+    "expanded_slots": 2052
+  },
+  "rng_recipe": {
+    "layout": "Python random.Random(seed); cases() in benchmark.py",
+    "case_seed": "seed + int(sha256(case_name)[:8], 16)",
+    "attention_seed": "case_seed + heads * 1000",
+    "selector": "CUDA torch.Generator(case_seed), random post-RoPE query and pooled-key features",
+    "portability": "Exact tensor/top-k fingerprints may differ across PyTorch/CUDA versions"
+  },
+  "cases": [
+    {
+      "name": "boundaries",
+      "real_documents": 11,
+      "valid_tokens": 38167,
+      "padding_tokens": 0,
+      "lengths": [3, 4, 7, 127, 129, 512, 513, 2051, 2052, 16384, 16385],
+      "total_tokens": 38167,
+      "padding_is_independent_segment": false
+    },
+    {
+      "name": "dense-ragged",
+      "real_documents": 13,
+      "valid_tokens": 11712,
+      "padding_tokens": 0,
+      "lengths": [1548, 1325, 460, 693, 791, 1053, 1243, 73, 499, 825, 45, 1361, 1796],
+      "total_tokens": 11712,
+      "padding_is_independent_segment": false
+    },
+    {
+      "name": "packed-short64",
+      "real_documents": 13,
+      "valid_tokens": 64109,
+      "padding_tokens": 1427,
+      "lengths": [
+        3837, 4868, 4490, 1210, 3483, 6383, 8117, 6194, 1986, 5609, 8170, 7010, 2752, 1427
+      ],
+      "total_tokens": 65536,
+      "padding_is_independent_segment": true
+    },
+    {
+      "name": "packed-mixed64",
+      "real_documents": 13,
+      "valid_tokens": 64480,
+      "padding_tokens": 1056,
+      "lengths": [
+        2054, 3901, 3173, 1025, 3818, 5356, 26960, 3431, 2752, 1130, 3500, 4489, 2891, 1056
+      ],
+      "total_tokens": 65536,
+      "padding_is_independent_segment": true
+    },
+    {
+      "name": "packed-short128",
+      "real_documents": 26,
+      "valid_tokens": 126615,
+      "padding_tokens": 4457,
+      "lengths": [
+        4168, 4680, 6817, 4208, 5105, 1414, 8192, 6017, 2051, 5284, 8010, 6773, 3202, 4810, 8159,
+        3343, 7788, 6540, 1815, 5514, 3335, 3186, 4834, 6550, 2051, 2769, 4457
+      ],
+      "total_tokens": 131072,
+      "padding_is_independent_segment": true
+    },
+    {
+      "name": "packed-mixed128",
+      "real_documents": 13,
+      "valid_tokens": 128720,
+      "padding_tokens": 2352,
+      "lengths": [
+        24784, 4097, 5536, 1025, 1025, 14603, 5404, 27771, 8312, 10155, 11358, 4097, 10553, 2352
+      ],
+      "total_tokens": 131072,
+      "padding_is_independent_segment": true
+    },
+    {
+      "name": "single-16384",
+      "real_documents": 1,
+      "valid_tokens": 16384,
+      "padding_tokens": 0,
+      "lengths": [16384],
+      "total_tokens": 16384,
+      "padding_is_independent_segment": false
+    },
+    {
+      "name": "single-32768",
+      "real_documents": 1,
+      "valid_tokens": 32768,
+      "padding_tokens": 0,
+      "lengths": [32768],
+      "total_tokens": 32768,
+      "padding_is_independent_segment": false
+    },
+    {
+      "name": "single-65536",
+      "real_documents": 1,
+      "valid_tokens": 65536,
+      "padding_tokens": 0,
+      "lengths": [65536],
+      "total_tokens": 65536,
+      "padding_is_independent_segment": false
+    },
+    {
+      "name": "single-131072",
+      "real_documents": 1,
+      "valid_tokens": 131072,
+      "padding_tokens": 0,
+      "lengths": [131072],
+      "total_tokens": 131072,
+      "padding_is_independent_segment": false
+    }
+  ]
+}

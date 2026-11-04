@@ -1,0 +1,27 @@
+{
+  "repository_runner_sha256": "24aa7f16c0b792202e90ef7f8f6071bb7c7018cb8df64b56117b70ecdaa12105",
+  "original_measurement_runner_sha256": "a640338fdfc726e444a00168cd8aef6c07677705a695850ff1c978302404f802",
+  "operator_source_validation": "All 12 existing repository files match the pinned Git blobs/SHA256; no HEAD equality requirement",
+  "unchanged_ast_functions": [
+    "random_lengths",
+    "cases",
+    "score_topk",
+    "make_selection",
+    "bitmap_metadata",
+    "flash",
+    "reference",
+    "errors",
+    "timed",
+    "fingerprint"
+  ],
+  "cpu_tests": {
+    "command": "python3 -m unittest discover -s tests/examples -p test_qsa_h20_benchmark.py -v",
+    "passed": 4
+  },
+  "repository_gpu_smoke": {
+    "state": "NOT_RUN_RESOURCE_UNAVAILABLE",
+    "reason": "The supplied H20 validation resource had no available containers at repository integration time. No replacement task was created."
+  },
+  "formal_reference": "Existing 58 passing cells, 3 rounds x 9 samples; measured with the archived standalone runner, not relabeled as repository-loader measurements",
+  "export_validation": "Code and input schema reviewed; local tensor export has not been rerun on a GPU after repository integration"
+}

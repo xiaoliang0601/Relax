@@ -1,0 +1,26 @@
+[
+  {
+    "file": "packed-short64-6q-v2.trace.json",
+    "changes": ["Portable traceName basename", "Device UUID omitted when present"],
+    "trace_events_unchanged": true,
+    "trace_events_sha256": "876a691692a4cc8205138b9669fc462efd37274e16efd01c199779f60b1afab4"
+  },
+  {
+    "file": "packed-mixed64-6q-v2.trace.json",
+    "changes": ["Portable traceName basename", "Device UUID omitted when present"],
+    "trace_events_unchanged": true,
+    "trace_events_sha256": "a368008b80f60db6271195e6017b6cc7f9d03f5babb004724e88ba0f8ab63c6f"
+  },
+  {
+    "file": "packed-short64-6q-nv-flash-per-doc.trace.json",
+    "changes": ["Portable traceName basename", "Device UUID omitted when present"],
+    "trace_events_unchanged": true,
+    "trace_events_sha256": "d8adc97ae8d0eb4ce47089fd49f85466e0043612e1b5cbcfed12a632ee02fd70"
+  },
+  {
+    "file": "packed-mixed64-6q-nv-flash-per-doc.trace.json",
+    "changes": ["Portable traceName basename", "Device UUID omitted when present"],
+    "trace_events_unchanged": true,
+    "trace_events_sha256": "8f7f9e64347deb06183e63ae13b0156d354fa789be44ff6b0853a84c43442806"
+  }
+]
