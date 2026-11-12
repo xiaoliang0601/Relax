@@ -1,0 +1,148 @@
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -2,11 +2,14 @@
+ ARG HTTP_PROXY
+ ARG HTTPS_PROXY
+ ARG NO_PROXY
+-ARG BASE_IMAGE=mirror.ccs.tencentyun.com/lmsysorg/sglang:v0.5.17-cu129
++ARG BASE_IMAGE=ghcr.io/redai-studio/relaxrl:sglang-v0.5.21-cu129
+ ARG TRAIN_IMAGE=train
+ ARG RELAX_CUDNN_VERSION=9.20.0.48
+ ARG HYBRID_EP_COMMIT=eb9cee7de5a24193bf09500668d3a619d3d3f3fb
+ FROM ${BASE_IMAGE} as base
++
++ARG MAX_JOBS=1
++ARG CARGO_BUILD_JOBS=1
+
+ ARG RELAX_CUDNN_VERSION
+ # TE can load the system cuDNN before the Python wheel.
+@@ -112,6 +115,10 @@
+ RUN cd /tmp/int4_qat && \
+     pip install . --no-build-isolation --no-cache-dir && \
+     rm -rf /tmp/int4_qat
++
++# Keep the training data stack compatible with NumPy 1.26.
++RUN pip install --no-cache-dir --no-deps pandas==3.0.6 pyarrow==24.0.0 && \
++    python -c "import pandas, pyarrow, datasets"
+
+ ARG TRAIN_IMAGE=train
+ # Build the CUDA 12 HybridEP wheel against the same Torch ABI as the final image.
+@@ -159,6 +166,15 @@
+ COPY docker/scripts/build_sglang_router.sh /tmp/build_sglang_router.sh
+ RUN bash /tmp/build_sglang_router.sh /tmp/router-patch /opt/router-wheels
+
++# Build the deferred HiCache completion binding with the final runtime's Torch ABI.
++FROM router_builder as tree_core_builder
++COPY docker/patch/sglang/v0.5.21.patch /tmp/tree-core.patch
++COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
++RUN cd /sgl-workspace/sglang && \
++    test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
++    git apply --check /tmp/tree-core.patch && git apply /tmp/tree-core.patch && \
++    python /tmp/build_sglang_tree_core.py build /sgl-workspace/sglang /opt/relax-tree-core
++
+ FROM ${TRAIN_IMAGE} as relax
+
+ ARG RELAX_CUDNN_VERSION
+@@ -170,7 +186,6 @@
+ WORKDIR /root
+
+ ARG PATCH_VERSION=latest
+-ARG ENABLE_SGLANG_PATCH=1
+ ARG HYBRID_EP_COMMIT
+ ENV RELAX_HYBRID_EP_COMMIT=${HYBRID_EP_COMMIT}
+
+@@ -264,24 +279,12 @@
+     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
+     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
+
+-COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
+-COPY docker/patch/latest/sglang_per_pos_topk.patch /sgl-workspace/sglang/
+-RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
+-    cd /sgl-workspace/sglang && git add . && \
+-    git update-index --refresh && \
+-    git apply sglang.patch --3way && \
+-    if grep -R -n '^<<<<<<< ' .; then \
+-    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
+-    exit 1; \
+-    fi && \
+-    git apply --check sglang_per_pos_topk.patch && \
+-    git apply sglang_per_pos_topk.patch && \
+-    rm sglang.patch sglang_per_pos_topk.patch; \
+-fi
+-
+-# Shared MCore model sources are installed above, but this CUDA 12 image retains
+-# its SGLang 0.5.17/TE 2.14 runtime. The optimized 280G Blackwell TP4 recipe and Qwen3.8
+-# SGLang 0.5.20 rollout require Dockerfile.cu13; Torch stays on CUDA 12.
++ENV RELAX_SGLANG_VERSION=0.5.21 SGLANG_RUST_BUILD_MODE=never
++RUN --mount=type=bind,source=docker/patch/sglang/v0.5.21.patch,target=/tmp/sglang.patch \
++    cd /sgl-workspace/sglang && \
++    test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
++    git apply --check /tmp/sglang.patch && git apply /tmp/sglang.patch && \
++    sha256sum /tmp/sglang.patch > /etc/relax-sglang-patch.sha256
+
+ # Shared experiment fixes belong in the default CUDA 12 build as well. Keep its
+ # NumPy<2, TE 2.14 and CUDA 12 libraries; do not install the 280G Blackwell cu13/v2 stack.
+@@ -296,38 +299,29 @@
+         --patch /tmp/fla042.patch --manifest /etc/relax-fla042-runtime.json && \
+     rm /tmp/fla042.patch
+ COPY --from=hybridep_builder /opt/ep-wheels /tmp/ep-wheels
+-COPY docker/patch/sglang/v0.5.17-transformers5-compat.patch /tmp/sglang-transformers5.patch
+ COPY docker/cu12-runtime-requirements.txt /opt/relax/cu12-runtime-requirements.txt
+ COPY docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch /opt/relax/te-wheel-tag.patch
+-# Apply after all pip installs; this cache specialization requires Frontend 1.27.0 / CuTe DSL 4.6.0.
+-COPY docker/patch/cudnn/1.27.0-dsa-sm90-signature-cache.patch /tmp/cudnn-dsa-sm90-signature-cache.patch
+ # Resolve late so existing compiled layers remain cached. NIXL packages both
+ # backends, but dispatches to cu12 based on Torch; this does not change CUDA.
+ # Pin Qwen3.8 HF support without replacing the CUDA/Torch/TE/DeepEP stack.
+-RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d.metadata["Name"], d.version) for d in m.distributions() if d.metadata["Name"].lower().replace("_", "-") in ("torch", "torchvision", "torchaudio", "triton", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch") or d.metadata["Name"].lower().startswith("nvidia-")))' > /tmp/cu12-abi-constraints.txt && \
++RUN --mount=type=bind,from=tree_core_builder,source=/opt/relax-tree-core,target=/tmp/relax-tree-core \
++    --mount=type=bind,source=docker/scripts/build_sglang_tree_core.py,target=/tmp/build_sglang_tree_core.py \
++    python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d.metadata["Name"], d.version) for d in m.distributions() if d.metadata["Name"].lower().replace("_", "-") in ("torch", "torchvision", "torchaudio", "triton", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch") or d.metadata["Name"].lower().startswith("nvidia-")))' > /tmp/cu12-abi-constraints.txt && \
+     pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt -r /opt/relax/cu12-runtime-requirements.txt && \
+     python /opt/relax/repair_te_wheel_metadata.py /opt/relax/te-wheel-tag.patch && \
+     pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1" && \
+     pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
+     rm -r /tmp/ep-wheels && \
+-    patch --batch --forward --fuzz=0 -d /sgl-workspace/sglang -p1 < /tmp/sglang-transformers5.patch && \
+     pip install --no-cache-dir setuptools-scm==9.2.2 && \
+-    SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.17 \
++    SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.21 \
+         pip install --no-cache-dir --no-deps --no-build-isolation -e /sgl-workspace/sglang/python && \
+     pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt transformers==5.16.0 tokenizers==0.23.2 && \
+-    rm /tmp/sglang-transformers5.patch && \
++    python /tmp/build_sglang_tree_core.py install /tmp/relax-tree-core && \
+     python -c 'from importlib.metadata import version; \
+         assert version("transformers") == "5.16.0"; assert version("tokenizers") == "0.23.2"; \
+-        assert version("sglang") == "0.5.17"; \
++        assert version("sglang") == "0.5.21"; \
+         from transformers.models.auto.configuration_auto import CONFIG_MAPPING; \
+         assert CONFIG_MAPPING["qwen4_exp"].model_type == "qwen4_exp"; \
+         import sglang.srt.configs.qwen3_asr' && \
+     python /opt/relax/validate_hybridep_install.py && \
+-    CUDNN_SITE="$(python -c 'import importlib.metadata as m; \
+-        assert m.version("nvidia-cudnn-frontend") == "1.27.0", "DSA SM90 patch requires cuDNN Frontend 1.27.0"; \
+-        assert m.version("nvidia-cutlass-dsl") == "4.6.0", "DSA SM90 patch requires CuTe DSL 4.6.0"; \
+-        print(m.distribution("nvidia-cudnn-frontend").locate_file(""))')" && \
+-    patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 < /tmp/cudnn-dsa-sm90-signature-cache.patch && \
+-    python -m py_compile "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py" && \
+-    rm /tmp/cudnn-dsa-sm90-signature-cache.patch && \
+     python /opt/relax/validate_final_runtime.py --profile cu12 --cudnn-version "${RELAX_CUDNN_VERSION}"
+--- a/docker/cu12-runtime-requirements.txt
++++ b/docker/cu12-runtime-requirements.txt
+@@ -1,10 +1,16 @@
+ # Complete late --no-deps installs while retaining the CUDA 12 NumPy ABI.
+ numpy==1.26.4
++scipy<1.18
++pandas<3.1
++ml-dtypes<0.6
+ hydra-core==1.3.2
+ nixl==1.3.2
+ nixl-cu12==1.3.2
+ nixl-cu13==1.3.2
+ packaging==25.0
++virtualenv==20.35.3
++setuptools-scm==9.2.2
++vcs-versioning==2.1.2
+ cuda-pathfinder==1.5.4
+ protobuf==6.33.5
+ grpcio-tools==1.81.1

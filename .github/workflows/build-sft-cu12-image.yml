@@ -16,17 +16,24 @@ jobs:
     env:
       SOURCE_SHA: 0d65aba3c54238f119e19b5aa8de65e8fdc99f36
       SOURCE_TAG: sft-ce-cu12-0d65aba3
-      BASE_IMAGE: docker.io/lmsysorg/sglang:v0.5.17-cu129@sha256:220bb1a1a4b38e604ebd33c876a279f6d2519035de141200720417407c9b967d
-      IMAGE: ghcr.io/xiaoliang0601/relax-sft-cu12:dev-0d65aba3-cu12
+      BASE_IMAGE: ghcr.io/redai-studio/relaxrl:sglang-v0.5.21-cu129@sha256:24fe058f0b5aa87aead7cf35b58d6a3cae6b8fc238ba870015d6a8037c1b6402
+      IMAGE: ghcr.io/xiaoliang0601/relax-sft-cu12:dev-0d65aba3-sglang0521-cu12
     steps:
-      - name: Check out the PR source
+      - name: Check out the build recipe
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check out the tagged Relax source
         uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ env.SOURCE_TAG }}
+          path: source
           persist-credentials: false
 
       - name: Prepare the hosted runner
         shell: bash
+        working-directory: source
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
@@ -38,13 +45,23 @@ jobs:
 
       - name: Prepare the tagged source for offline checkout
         shell: bash
+        working-directory: source
         run: |
           set -euo pipefail
           git branch relax-runtime "$SOURCE_SHA"
           git clone --no-local --depth 1 --single-branch --branch relax-runtime --bare . "$RUNNER_TEMP/relax-source.git"
 
+      - name: Select the Hopper CUDA 12 build recipe
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          git apply --check ../.github/docker/sft-cu12-sglang0521.patch
+          git apply ../.github/docker/sft-cu12-sglang0521.patch
+
       - name: Build and publish the CUDA 12 dev image
         shell: bash
+        working-directory: source
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -82,5 +99,5 @@ jobs:
             --tag "$IMAGE" \
             --push .
           digest="$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' "$RUNNER_TEMP/image.json")"
-          printf 'Source %s\nImage %s@%s\n' "$SOURCE_SHA" "$IMAGE" "$digest" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'Source %s\nBuild recipe %s\nImage %s@%s\n' "$SOURCE_SHA" "$GITHUB_SHA" "$IMAGE" "$digest" | tee -a "$GITHUB_STEP_SUMMARY"
           docker buildx imagetools inspect "$IMAGE@$digest"
